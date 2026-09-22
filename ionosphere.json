@@ -1,0 +1,74 @@
+{
+    "retrieved_utc": "2026-09-22T23:31:06.504498+00:00",
+    "regional_condition": null,
+    "regional_percentage": null,
+    "t_index": 23.0,
+    "station_mufs": [
+        {
+            "station": "Brisbane",
+            "condition": "unknown",
+            "percentage": null
+        },
+        {
+            "station": "Canberra",
+            "condition": "unknown",
+            "percentage": null
+        },
+        {
+            "station": "Cocos Is",
+            "condition": "unknown",
+            "percentage": null
+        },
+        {
+            "station": "Darwin",
+            "condition": "unknown",
+            "percentage": null
+        },
+        {
+            "station": "Hobart",
+            "condition": "enhanced",
+            "percentage": 19.0
+        },
+        {
+            "station": "Learmonth",
+            "condition": "unknown",
+            "percentage": null
+        },
+        {
+            "station": "Niue Is",
+            "condition": "enhanced",
+            "percentage": 37.0
+        },
+        {
+            "station": "Norfolk Is",
+            "condition": "unknown",
+            "percentage": null
+        },
+        {
+            "station": "Perth",
+            "condition": "unknown",
+            "percentage": null
+        },
+        {
+            "station": "Sydney",
+            "condition": "unknown",
+            "percentage": null
+        },
+        {
+            "station": "Townsville",
+            "condition": "near normal",
+            "percentage": null
+        }
+    ],
+    "forecast_t_index": null,
+    "forecast_condition": null,
+    "forecast_percentage": null,
+    "source_status": {
+        "SWS MUF report": "OK",
+        "SWS ionospheric summary": "OK"
+    },
+    "raw": {
+        "MUF report": "SWS - Australasia - MUF Report skip page header Home Space Weather Aurora Satellite Geophysical Solar HF Systems Products and Services Educational World Data Centre Research HF Systems FORECAST SOL: Normal MAG: Moderate ION: Moderate Search Home HF Systems Australasia HF Conditions MUF Report Tuesday, Sep 22 2026 23:31 UT skip category menu Australasia HAP Charts HF Conditions Ionogram Viewer Ionospheric Map LAMP Charts T Index High Latitude High Latitude Conditions High Latitude Links Global HF HF Conditions Fadeout Charts Polar Cap Absorption T Index Ionospheric Map HAP Charts LAMP Charts T Index Map Online Tools Prediction Tools Index Plots Section Information HF Systems Help Page HF Communications Problem Page Australasia MUF Report Automated Report on Current Australian Ionospheric Conditions (last updated 22 Sep 2026 23:01 UT) Australian Region conditions at: 2300 UT 22/09/26 Station Vertical Maximum Usable Frequencies (MUFs) - average over last 2 hours ===================================================================================== Brisbane : no vertical MUF data. Canberra : near normal Cocos Is : no vertical MUF data. Darwin : near normal Hobart : enhanced by 19% Learmonth : near normal Niue Is : enhanced by 37% Norfolk Is : near normal Perth : near normal Sydney : no vertical MUF data. Townsville : near normal ========================================================================================= Antarctic Station Vertical Maximum Usable Frequencies (MUFs) - average over last 4 hours ========================================================================================= Casey : enhanced by 16% Davis : no vertical MUF data or possible ionospheric absorption. Mawson : near normal ==================================================================== Note: autoscaled data is used to produce this report. Antarctic region autoscaled data can be inaccurate. Please check online ionograms to confirm conditions. MUFs within 15% of monthly predicted values are described as normal. About ASWFC Feedback Contact Us Site Help Site News Site Map Acknowledgments Subscribe Australian Space Weather Alert System --> &copy; Copyright Commonwealth of Australia 2026, Bureau of Meteorology (ABN 92 637 533 532) disclaimer privacy accessibility",
+        "Ionospheric summary": "SWS - Australasia - Ionospheric Summary and Forecast skip page header Home Space Weather Aurora Satellite Geophysical Solar HF Systems Products and Services Educational World Data Centre Research HF Systems FORECAST SOL: Normal MAG: Moderate ION: Moderate Search Home HF Systems Australasia HF Conditions Ionospheric Summary and Forecast Tuesday, Sep 22 2026 23:31 UT skip category menu Australasia HAP Charts HF Conditions Ionogram Viewer Ionospheric Map LAMP Charts T Index High Latitude High Latitude Conditions High Latitude Links Global HF HF Conditions Fadeout Charts Polar Cap Absorption T Index Ionospheric Map HAP Charts LAMP Charts T Index Map Online Tools Prediction Tools Index Plots Section Information HF Systems Help Page HF Communications Problem Page Australasia Ionospheric Summary and Forecast Ionospheric Summary (last updated 22 Sep 2026 23:30 UT) Date T index 22 Sep 71 Observed Australian Regional MUFs Cocos Island Region: No data available during local day. No data available during local night. Niue Island Region: Enhanced by 25% during local day. Enhanced by 15% during local night. Enhanced by 30% after local dawn. Northern Australian Region: Near predicted monthly values. Southern Australian Region: Near predicted monthly values. Antarctic Region (Casey/Davis/Mawson): Near predicted monthly values over the UT day. Monthly T index: Month T index Aug 66 Sep 62 Oct 60 Ionospheric Forecast (last updated 22 Sep 2026 23:30 UT) Date T index MUFs 23 Sep 50 Near predicted monthly values 24 Sep 45 Near predicted monthly values 25 Sep 60 Near predicted monthly values COMMENT: Maximum Usable Frequencies (MUFs) in the Australian region were mostly near predicted monthly values over UT day 22-Sep, with notable enhancements seen at Niue. Mild spread-F was observed at Canberra. MUFs are forecast to be near predicted monthly values over 23-25 Sep. While depressions are expected due to anticipated geomagnetic activity, current MUFs are already mildly elevated above predicted monthly values. About ASWFC Feedback Contact Us Site Help Site News Site Map Acknowledgments Subscribe Australian Space Weather Alert System --> &copy; Copyright Commonwealth of Australia 2026, Bureau of Meteorology (ABN 92 637 533 532) disclaimer privacy accessibility"
+    }
+}
