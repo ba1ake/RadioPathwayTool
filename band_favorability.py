@@ -1,41 +1,52 @@
-
 """
-band_favorability.py
+RadioPathwayTool
+SWS HAP propagation engine
 
-HF propagation analysis using the Australian Bureau of Meteorology
-Space Weather Services (SWS) Hourly HF Availability Prediction (HAP).
+This module retrieves and decodes the Australian Bureau of Meteorology
+Space Weather Services (SWS) HF Availability Prediction (HAP) charts.
 
-Current focus:
-    - Generate an SWS HAP request centred on the requested base location.
-    - Download the four HAP image pages covering 00-23 UTC.
-    - Decode the HAP colour at each geographic grid point.
-    - Translate HAP colours into the requested frequencies/bands.
-    - Provide raw HAP results for later integration into the propagation model.
+The HAP data is treated as the primary propagation prediction.
 
-IMPORTANT:
-    HAP is a propagation prediction product, not a probability-of-contact
-    calculator.
+This module deliberately does NOT produce an arbitrary 0-100 score.
 
-    The HAP chart indicates which requested HF frequency is predicted to
-    be suitable for the base-to-location circuit.
+Instead it exposes structured propagation information which can later
+be combined with:
 
-    The decoder therefore reports:
-        "HAP recommends 7.150 MHz here"
+    - SWS ionosphere observations
+    - space weather
+    - data age
+    - PSK Reporter
+    - WSPR
+    - user radio / antenna information
 
-    rather than:
-        "There is an 80% chance of contact."
+HAP frequencies:
 
-This module deliberately keeps the HAP decoding separate from the final
-band-favorability scoring system until the decoder has been validated.
+    160m = 1.838 MHz
+     80m = 3.650 MHz
+     40m = 7.150 MHz
+     30m = 10.125 MHz
+     20m = 14.175 MHz
+     17m = 18.118 MHz
+     15m = 21.225 MHz
+     12m = 24.940 MHz
+     10m = 28.850 MHz
+
+SWS returns four GIF pages:
+
+    Page 1 -> 00-05 UTC
+    Page 2 -> 06-11 UTC
+    Page 3 -> 12-17 UTC
+    Page 4 -> 18-23 UTC
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
+
 import hashlib
 import re
 
@@ -44,215 +55,120 @@ from PIL import Image
 
 
 # ============================================================================
-# SWS CONFIGURATION
+# CONFIGURATION
 # ============================================================================
 
 SWS_BASE_URL = "https://www.sws.bom.gov.au"
 
 SWS_HAP_CGI = (
-    "https://www.sws.bom.gov.au/"
-    "local-cgi-bin/phapj-cgi.tcl"
-)
-
-SWS_HAP_IMAGE_BASE = (
-    "https://www.sws.bom.gov.au"
+    f"{SWS_BASE_URL}/local-cgi-bin/phapj-cgi.tcl"
 )
 
 CACHE_DIR = Path(".hap_cache")
 
+REQUEST_TIMEOUT = 30
+
 
 # ============================================================================
-# BAND / FREQUENCY DEFINITIONS
+# FREQUENCIES
 # ============================================================================
-
-# Frequencies are the same frequencies used by the SWS HAP request.
-#
-# The HAP legend associates each colour with one requested frequency.
-#
-# Keep these in ascending order.
 
 BANDS = {
-    "160m": 1.838,
-    "80m": 3.650,
-    "40m": 7.150,
-    "30m": 10.125,
-    "20m": 14.175,
-    "17m": 18.118,
-    "15m": 21.225,
-    "12m": 24.940,
-    "10m": 28.850,
+    "160m": 1838,
+    "80m": 3650,
+    "40m": 7150,
+    "30m": 10125,
+    "20m": 14175,
+    "17m": 18118,
+    "15m": 21225,
+    "12m": 24940,
+    "10m": 28850,
+}
+
+FREQUENCY_TO_BAND = {
+    frequency: band
+    for band, frequency in BANDS.items()
 }
 
 
 # ============================================================================
-# HAP COLOUR DEFINITIONS
+# HAP COLOURS
 # ============================================================================
-
-# These colours were determined from the SWS HAP legend used by the
-# nine-frequency request.
-#
-# RGB:
-#
-#   160m  yellow
-#   80m   red
-#   40m   olive
-#   30m   green
-#   20m   cyan
-#   17m   lime
-#   15m   teal
-#   12m   blue
-#   10m   navy
-#
-# Exact colours are important because the GIF uses a fixed palette.
 
 HAP_COLOURS = {
-    (255, 255, 0): ("160m", 1.838),
-    (255, 0, 0): ("80m", 3.650),
-    (128, 128, 0): ("40m", 7.150),
-    (0, 128, 0): ("30m", 10.125),
-    (0, 255, 255): ("20m", 14.175),
-    (0, 255, 0): ("17m", 18.118),
-    (0, 128, 128): ("15m", 21.225),
-    (0, 0, 255): ("12m", 24.940),
-    (0, 0, 128): ("10m", 28.850),
-}
-
-
-# Reverse lookup.
-
-BAND_COLOURS = {
-    band: colour
-    for colour, (band, _frequency) in HAP_COLOURS.items()
+    (255, 255, 0): 1838,      # Yellow
+    (255, 0, 0): 3650,        # Red
+    (128, 128, 0): 7150,      # Olive
+    (0, 128, 0): 10125,       # Green
+    (0, 255, 255): 14175,     # Cyan
+    (0, 255, 0): 18118,       # Lime
+    (0, 128, 128): 21225,     # Teal
+    (0, 0, 255): 24940,       # Blue
+    (0, 0, 128): 28850,       # Navy
 }
 
 
 # ============================================================================
-# HAP DATA STRUCTURES
+# DISCOVERED MAP GEOMETRY
+# ============================================================================
+
+"""
+The actual geographic map area inside each hourly HAP panel was found
+experimentally from the SWS GIF.
+
+Panel:
+
+    approximately 290 x 179 pixels
+
+Effective map:
+
+    X = 12 .. 289
+    Y = 2  .. 178
+
+The extreme edges can contain borders. Therefore boundary grid points
+are sampled slightly inward.
+"""
+
+HAP_MAP_X_MIN = 12
+HAP_MAP_X_MAX = 289
+
+HAP_MAP_Y_MIN = 2
+HAP_MAP_Y_MAX = 178
+
+EDGE_INSET = 2
+
+
+# ============================================================================
+# DATA CLASSES
 # ============================================================================
 
 @dataclass
 class HAPConfig:
     """
-    Configuration used to generate an SWS HAP request.
-
-    The geographic grid is deliberately centred around the base location.
-
-    For a 7x7 grid with 5-degree spacing:
-
-        155  160  165  170  175  180  185
-         |    |    |    |    |    |    |
-        ...                  |
-                             ↓
-                         BASE LOCATION
+    Configuration used to request an HAP grid.
     """
 
-    latitude: float
-    longitude: float
-    base_name: str = "Base"
+    base_name: str
 
-    grid_step_lat: float = 5.0
-    grid_step_lon: float = 5.0
+    base_lat: float
+    base_lon: float
 
-    grid_rows: int = 7
-    grid_cols: int = 7
+    nw_lat: float
+    nw_lon: float
 
-    # HAP frequencies.
-    frequencies_khz: tuple[int, ...] = (
-        1838,
-        3650,
-        7150,
-        10125,
-        14175,
-        18118,
-        21225,
-        24940,
-        28850,
-    )
+    step_lat: float = 5.0
+    step_lon: float = 5.0
 
-    def __post_init__(self):
-        if self.grid_rows % 2 == 0:
-            raise ValueError("grid_rows must be odd so the base can be centred")
+    nrows: int = 7
+    ncols: int = 7
 
-        if self.grid_cols % 2 == 0:
-            raise ValueError("grid_cols must be odd so the base can be centred")
-
-    @property
-    def centre_row(self) -> int:
-        return self.grid_rows // 2
-
-    @property
-    def centre_col(self) -> int:
-        return self.grid_cols // 2
-
-    @property
-    def nw_latitude(self) -> float:
-        """
-        Calculate the northernmost grid latitude.
-
-        Example:
-            base = -41.27
-            7 rows
-            5-degree spacing
-
-            NW = -26.27
-        """
-
-        half_height = self.centre_row * self.grid_step_lat
-
-        return self.latitude + half_height
-
-    @property
-    def nw_longitude(self) -> float:
-        """
-        Calculate the westernmost grid longitude.
-        """
-
-        half_width = self.centre_col * self.grid_step_lon
-
-        return self.longitude - half_width
-
-    def grid_latitude(self, row: int) -> float:
-        return self.nw_latitude - (row * self.grid_step_lat)
-
-    def grid_longitude(self, col: int) -> float:
-        return self.nw_longitude + (col * self.grid_step_lon)
-
-    def grid_coordinates(self) -> list[tuple[int, int, float, float]]:
-        """
-        Return every geographic grid point.
-
-        Each tuple is:
-
-            row,
-            column,
-            latitude,
-            longitude
-        """
-
-        points = []
-
-        for row in range(self.grid_rows):
-            for col in range(self.grid_cols):
-
-                lat = self.grid_latitude(row)
-                lon = self.grid_longitude(col)
-
-                points.append(
-                    (
-                        row,
-                        col,
-                        lat,
-                        lon,
-                    )
-                )
-
-        return points
+    tindex: int = 5
 
 
 @dataclass
 class HAPGridPoint:
     """
-    One decoded HAP geographic grid point.
+    Geographic point and its corresponding location in the rendered HAP map.
     """
 
     row: int
@@ -261,73 +177,41 @@ class HAPGridPoint:
     latitude: float
     longitude: float
 
-    band: Optional[str] = None
-    frequency_mhz: Optional[float] = None
+    pixel_x: float
+    pixel_y: float
 
-    rgb: Optional[tuple[int, int, int]] = None
 
-    supported: bool = False
+@dataclass
+class HAPRecommendation:
+    """
+    HAP recommendation at one geographic grid point and hour.
+    """
 
-    confidence: float = 0.0
+    hour_utc: int
 
-    notes: list[str] = field(default_factory=list)
+    row: int
+    col: int
+
+    latitude: float
+    longitude: float
+
+    band: Optional[str]
+    frequency_khz: Optional[int]
+
+    pixel_x: float
+    pixel_y: float
+
+    sample_support: int
 
 
 @dataclass
 class HAPHourResult:
     """
-    Decoded result for one UTC hour.
+    Raw hourly HAP image panel.
     """
 
     hour_utc: int
-
-    image_url: Optional[str] = None
-    image_path: Optional[Path] = None
-
-    grid_points: list[HAPGridPoint] = field(default_factory=list)
-
-    decoding_success: bool = False
-
-    notes: list[str] = field(default_factory=list)
-
-    @property
-    def supported_bands(self) -> set[str]:
-        return {
-            point.band
-            for point in self.grid_points
-            if point.supported and point.band is not None
-        }
-
-    def band_counts(self) -> dict[str, int]:
-        counts = {
-            band: 0
-            for band in BANDS
-        }
-
-        for point in self.grid_points:
-            if point.band in counts:
-                counts[point.band] += 1
-
-        return counts
-
-
-@dataclass
-class HAPFrequencyResult:
-    """
-    Full HAP result for one base location.
-    """
-
-    config: HAPConfig
-
-    hourly: dict[int, HAPHourResult] = field(default_factory=dict)
-
-    source_url: Optional[str] = None
-
-    retrieved_utc: Optional[datetime] = None
-
-    success: bool = False
-
-    error: Optional[str] = None
+    panel: Image.Image
 
 
 # ============================================================================
@@ -335,17 +219,13 @@ class HAPFrequencyResult:
 # ============================================================================
 
 class HAPCollector:
-    """
-    Downloads and decodes SWS HAP charts.
-    """
 
     def __init__(
         self,
-        cache_dir: Path | str = CACHE_DIR,
-        timeout: int = 30,
-    ):
-        self.cache_dir = Path(cache_dir)
-        self.timeout = timeout
+        cache_dir: Path = CACHE_DIR,
+    ) -> None:
+
+        self.cache_dir = cache_dir
 
         self.cache_dir.mkdir(
             parents=True,
@@ -364,86 +244,218 @@ class HAPCollector:
         )
 
     # ------------------------------------------------------------------------
-    # REQUEST GENERATION
+    # Create centred geographic grid
     # ------------------------------------------------------------------------
 
-    def build_hap_url(
+    @staticmethod
+    def create_centred_config(
+        base_name: str,
+        base_lat: float,
+        base_lon: float,
+        nrows: int = 7,
+        ncols: int = 7,
+        step_lat: float = 5.0,
+        step_lon: float = 5.0,
+    ) -> HAPConfig:
+
+        centre_row = nrows // 2
+        centre_col = ncols // 2
+
+        nw_lat = (
+            base_lat
+            + centre_row * step_lat
+        )
+
+        nw_lon = (
+            base_lon
+            - centre_col * step_lon
+        )
+
+        return HAPConfig(
+            base_name=base_name,
+            base_lat=base_lat,
+            base_lon=base_lon,
+            nw_lat=nw_lat,
+            nw_lon=nw_lon,
+            step_lat=step_lat,
+            step_lon=step_lon,
+            nrows=nrows,
+            ncols=ncols,
+        )
+
+    # ------------------------------------------------------------------------
+    # Build geographic grid
+    # ------------------------------------------------------------------------
+
+    @staticmethod
+    def build_grid(
+        config: HAPConfig,
+    ) -> list[HAPGridPoint]:
+
+        points = []
+
+        for row in range(config.nrows):
+
+            latitude = (
+                config.nw_lat
+                - row * config.step_lat
+            )
+
+            for col in range(config.ncols):
+
+                longitude = (
+                    config.nw_lon
+                    + col * config.step_lon
+                )
+
+                # ------------------------------------------------------------
+                # Geographic -> rendered map coordinates
+                # ------------------------------------------------------------
+
+                if config.ncols > 1:
+
+                    x_fraction = (
+                        col
+                        / (config.ncols - 1)
+                    )
+
+                else:
+
+                    x_fraction = 0.5
+
+                if config.nrows > 1:
+
+                    y_fraction = (
+                        row
+                        / (config.nrows - 1)
+                    )
+
+                else:
+
+                    y_fraction = 0.5
+
+                pixel_x = (
+                    HAP_MAP_X_MIN
+                    + x_fraction
+                    * (
+                        HAP_MAP_X_MAX
+                        - HAP_MAP_X_MIN
+                    )
+                )
+
+                pixel_y = (
+                    HAP_MAP_Y_MIN
+                    + y_fraction
+                    * (
+                        HAP_MAP_Y_MAX
+                        - HAP_MAP_Y_MIN
+                    )
+                )
+
+                # ------------------------------------------------------------
+                # Avoid sampling directly on rendered map borders.
+                # ------------------------------------------------------------
+
+                if col == 0:
+
+                    pixel_x += EDGE_INSET
+
+                elif col == config.ncols - 1:
+
+                    pixel_x -= EDGE_INSET
+
+                if row == 0:
+
+                    pixel_y += EDGE_INSET
+
+                elif row == config.nrows - 1:
+
+                    pixel_y -= EDGE_INSET
+
+                points.append(
+                    HAPGridPoint(
+                        row=row,
+                        col=col,
+                        latitude=latitude,
+                        longitude=longitude,
+                        pixel_x=pixel_x,
+                        pixel_y=pixel_y,
+                    )
+                )
+
+        return points
+
+    # ------------------------------------------------------------------------
+    # Build CGI request
+    # ------------------------------------------------------------------------
+
+    def build_request_url(
         self,
         config: HAPConfig,
-        timestamp_utc: datetime,
+        timestamp_utc: Optional[datetime] = None,
     ) -> str:
-        """
-        Build the SWS HAP CGI URL.
 
-        The geographic grid is automatically centred around the base.
-        """
+        if timestamp_utc is None:
 
-        timestamp_utc = timestamp_utc.astimezone(timezone.utc)
+            timestamp_utc = datetime.now(
+                timezone.utc
+            )
+
+        frequencies = list(
+            BANDS.values()
+        )
 
         params = {
-            "baslat": f"{config.latitude:.4f}",
-            "baslng": f"{config.longitude:.4f}",
+            "baslat": f"{config.base_lat:.4f}",
+            "baslng": f"{config.base_lon:.4f}",
             "basename": config.base_name,
 
-            "numfreqs": str(len(config.frequencies_khz)),
+            "numfreqs": len(frequencies),
 
-            "year": str(timestamp_utc.year),
-            "month": str(timestamp_utc.month),
-            "day": str(timestamp_utc.day),
+            "year": timestamp_utc.year,
+            "month": timestamp_utc.month,
+            "day": timestamp_utc.day,
 
-            # We request the whole UTC day.
-            #
-            # The returned result consists of four pages:
-            #   00-05
-            #   06-11
-            #   12-17
-            #   18-23
-            "tindex": str(timestamp_utc.hour),
+            "tindex": config.tindex,
 
-            "nwlat": f"{config.nw_latitude:.4f}",
-            "nwlng": f"{config.nw_longitude:.4f}",
+            "nwlat": f"{config.nw_lat:.4f}",
+            "nwlng": f"{config.nw_lon:.4f}",
 
-            "steplat": f"{config.grid_step_lat:.4f}",
-            "steplng": f"{config.grid_step_lon:.4f}",
+            "steplat": f"{config.step_lat:.4f}",
+            "steplng": f"{config.step_lon:.4f}",
 
-            "nrows": str(config.grid_rows),
-            "ncols": str(config.grid_cols),
+            "nrows": config.nrows,
+            "ncols": config.ncols,
         }
 
         for index, frequency in enumerate(
-            config.frequencies_khz,
+            frequencies,
             start=1,
         ):
-            params[f"freq{index}"] = str(frequency)
 
-        # The CGI expects the remaining frequency fields to exist in some
-        # versions, so leave freq10 empty for our nine-frequency request.
-        if len(config.frequencies_khz) < 10:
-            params["freq10"] = ""
+            params[
+                f"freq{index}"
+            ] = frequency
+
+        params["freq10"] = ""
 
         return (
             f"{SWS_HAP_CGI}?"
-            f"{urlencode(params)}"
+            + urlencode(params)
         )
 
     # ------------------------------------------------------------------------
-    # HTTP
+    # Fetch CGI
     # ------------------------------------------------------------------------
 
-    def download_hap_html(
+    def fetch_hap_page(
         self,
-        config: HAPConfig,
-        timestamp_utc: datetime,
+        url: str,
     ) -> str:
-
-        url = self.build_hap_url(
-            config,
-            timestamp_utc,
-        )
 
         response = self.session.get(
             url,
-            timeout=self.timeout,
+            timeout=REQUEST_TIMEOUT,
         )
 
         response.raise_for_status()
@@ -451,26 +463,17 @@ class HAPCollector:
         return response.text
 
     # ------------------------------------------------------------------------
-    # IMAGE URL EXTRACTION
+    # Extract GIF URLs
     # ------------------------------------------------------------------------
 
+    @staticmethod
     def extract_image_urls(
-        self,
         html: str,
     ) -> list[str]:
-        """
-        Extract HAP GIF image URLs from the CGI output.
-
-        The SWS response normally contains four GIF links:
-
-            hap1....gif  -> 00-05 UTC
-            hap2....gif  -> 06-11 UTC
-            hap3....gif  -> 12-17 UTC
-            hap4....gif  -> 18-23 UTC
-        """
 
         matches = re.findall(
-            r'(?:src|href)=["\']([^"\']*hap[1-4][^"\']*\.gif)["\']',
+            r'(?:https?://[^"\']+)?'
+            r'/olts/hapimgs/[^"\']+\.gif',
             html,
             flags=re.IGNORECASE,
         )
@@ -479,478 +482,112 @@ class HAPCollector:
 
         for match in matches:
 
-            if match.startswith("http://"):
-                url = match
+            if match.startswith("http"):
 
-            elif match.startswith("https://"):
                 url = match
-
-            elif match.startswith("/"):
-                url = (
-                    f"{SWS_BASE_URL}"
-                    f"{match}"
-                )
 
             else:
+
                 url = (
-                    f"{SWS_BASE_URL}/"
-                    f"{match}"
+                    SWS_BASE_URL
+                    + match
                 )
 
             if url not in urls:
+
                 urls.append(url)
 
         return urls
 
     # ------------------------------------------------------------------------
-    # CACHE
+    # Cache filename
     # ------------------------------------------------------------------------
 
-    def _cache_name(
+    def cache_filename(
         self,
         url: str,
     ) -> Path:
 
-        digest = hashlib.sha256(
+        digest = hashlib.md5(
             url.encode("utf-8")
-        ).hexdigest()[:20]
+        ).hexdigest()
 
-        return self.cache_dir / f"{digest}.gif"
+        return (
+            self.cache_dir
+            / f"{digest}.gif"
+        )
+
+    # ------------------------------------------------------------------------
+    # Download image
+    # ------------------------------------------------------------------------
 
     def download_image(
         self,
         url: str,
     ) -> Path:
 
-        cache_path = self._cache_name(url)
+        path = self.cache_filename(
+            url
+        )
 
-        if cache_path.exists():
-            return cache_path
+        if path.exists():
+
+            return path
 
         response = self.session.get(
             url,
-            timeout=self.timeout,
+            timeout=REQUEST_TIMEOUT,
         )
 
         response.raise_for_status()
 
-        cache_path.write_bytes(
+        path.write_bytes(
             response.content
         )
 
-        return cache_path
+        return path
 
     # ------------------------------------------------------------------------
-    # IMAGE PANEL EXTRACTION
+    # Split page into hourly panels
     # ------------------------------------------------------------------------
 
+    @staticmethod
     def extract_hour_panels(
-        self,
         image: Image.Image,
     ) -> dict[int, Image.Image]:
-        """
-        Extract the six hourly map panels from a 700x900 SWS HAP image.
 
-        Page layout:
-
-            00   01
-            02   03
-            04   05
-
-        The exact image currently produced by SWS has approximate map
-        rectangles:
-
-            x = 50..340 / 360..650
-            y = 134..313
-            y = 381..560
-            y = 631..808
-
-        We retain the coordinates here as an explicit decoder parameter
-        rather than mixing them into the scoring logic.
-        """
-
-        width, height = image.size
-
-        if width < 650 or height < 850:
-            raise ValueError(
-                f"Unexpected HAP image size: {width}x{height}"
-            )
+        image = image.convert("RGB")
 
         boxes = [
-            (0, (50, 134, 340, 313)),
-            (1, (360, 134, 650, 313)),
-            (2, (50, 381, 340, 560)),
-            (3, (360, 381, 650, 560)),
-            (4, (50, 631, 340, 808)),
-            (5, (360, 631, 650, 808)),
+            (50, 134, 340, 313),
+            (360, 134, 650, 313),
+
+            (50, 381, 340, 560),
+            (360, 381, 650, 560),
+
+            (50, 631, 340, 808),
+            (360, 631, 650, 808),
         ]
 
         panels = {}
 
-        for index, box in boxes:
+        for index, box in enumerate(boxes):
 
-            panels[index] = image.crop(box)
+            panels[index] = image.crop(
+                box
+            )
 
         return panels
 
     # ------------------------------------------------------------------------
-    # COLOUR DECODING
-    # ------------------------------------------------------------------------
-
-    @staticmethod
-    def nearest_hap_colour(
-        rgb: tuple[int, int, int],
-    ) -> tuple[Optional[tuple[int, int, int]], float]:
-        """
-        Find the closest known HAP colour.
-
-        Returns:
-
-            colour,
-            similarity
-
-        Similarity is a simple normalized RGB-distance metric.
-
-        Exact HAP colours should normally produce similarity = 1.0.
-        """
-
-        best_colour = None
-        best_distance = float("inf")
-
-        for colour in HAP_COLOURS:
-
-            distance = sum(
-                (
-                    rgb[index] - colour[index]
-                ) ** 2
-                for index in range(3)
-            )
-
-            if distance < best_distance:
-
-                best_distance = distance
-                best_colour = colour
-
-        # Maximum RGB Euclidean distance.
-        max_distance = (
-            3 * (255 ** 2)
-        ) ** 0.5
-
-        distance = best_distance ** 0.5
-
-        similarity = 1.0 - (
-            distance / max_distance
-        )
-
-        return best_colour, similarity
-
-    @staticmethod
-    def dominant_colour(
-        image: Image.Image,
-        radius: int = 5,
-    ) -> tuple[Optional[tuple[int, int, int]], float]:
-        """
-        Determine the dominant HAP colour near the centre of a map panel.
-
-        This is intentionally only a diagnostic helper.
-
-        The next decoder stage will replace this with geographic grid
-        sampling once the map geometry is fully validated.
-        """
-
-        rgb_image = image.convert("RGB")
-
-        width, height = rgb_image.size
-
-        cx = width // 2
-        cy = height // 2
-
-        pixels = []
-
-        for y in range(
-            max(0, cy - radius),
-            min(height, cy + radius + 1),
-        ):
-
-            for x in range(
-                max(0, cx - radius),
-                min(width, cx + radius + 1),
-            ):
-
-                rgb = rgb_image.getpixel(
-                    (x, y)
-                )
-
-                if rgb in HAP_COLOURS:
-                    pixels.append(rgb)
-
-        if not pixels:
-            return None, 0.0
-
-        counts = {}
-
-        for rgb in pixels:
-            counts[rgb] = (
-                counts.get(rgb, 0) + 1
-            )
-
-        colour = max(
-            counts,
-            key=counts.get,
-        )
-
-        confidence = (
-            counts[colour] / len(pixels)
-        )
-
-        return colour, confidence
-
-    # ------------------------------------------------------------------------
-    # GEOGRAPHIC GRID DECODER
-    # ------------------------------------------------------------------------
-
-    def estimate_grid_pixel(
-        self,
-        panel: Image.Image,
-        config: HAPConfig,
-        row: int,
-        col: int,
-    ) -> tuple[int, int]:
-        """
-        Estimate the pixel position of a geographic grid point.
-
-        IMPORTANT:
-            This is currently based on proportional mapping.
-
-            We are deliberately keeping this isolated so it can be replaced
-            after validating the actual SWS map geometry.
-
-        The map panel is treated as representing the requested geographic
-        bounding box.
-        """
-
-        width, height = panel.size
-
-        if config.grid_cols <= 1:
-            x = width // 2
-        else:
-            x = round(
-                col
-                / (config.grid_cols - 1)
-                * (width - 1)
-            )
-
-        if config.grid_rows <= 1:
-            y = height // 2
-        else:
-            y = round(
-                row
-                / (config.grid_rows - 1)
-                * (height - 1)
-            )
-
-        return x, y
-
-    def sample_grid_point(
-        self,
-        panel: Image.Image,
-        config: HAPConfig,
-        row: int,
-        col: int,
-        radius: int = 4,
-    ) -> tuple[
-        Optional[tuple[int, int, int]],
-        float,
-    ]:
-        """
-        Sample a small area around an estimated geographic grid point.
-
-        Only known HAP colours are considered.
-
-        This reduces the chance of sampling text, borders, coastlines,
-        or other map graphics.
-        """
-
-        rgb_image = panel.convert("RGB")
-
-        width, height = rgb_image.size
-
-        cx, cy = self.estimate_grid_pixel(
-            panel,
-            config,
-            row,
-            col,
-        )
-
-        counts: dict[
-            tuple[int, int, int],
-            int
-        ] = {}
-
-        for y in range(
-            max(0, cy - radius),
-            min(height, cy + radius + 1),
-        ):
-
-            for x in range(
-                max(0, cx - radius),
-                min(width, cx + radius + 1),
-            ):
-
-                rgb = rgb_image.getpixel(
-                    (x, y)
-                )
-
-                if rgb in HAP_COLOURS:
-
-                    counts[rgb] = (
-                        counts.get(rgb, 0) + 1
-                    )
-
-        if not counts:
-            return None, 0.0
-
-        colour = max(
-            counts,
-            key=counts.get,
-        )
-
-        total = sum(counts.values())
-
-        confidence = (
-            counts[colour] / total
-        )
-
-        return colour, confidence
-
-    def decode_panel(
-        self,
-        panel: Image.Image,
-        config: HAPConfig,
-        hour_utc: int,
-    ) -> HAPHourResult:
-        """
-        Decode one hourly map.
-
-        Produces one HAPGridPoint per geographic grid coordinate.
-        """
-
-        result = HAPHourResult(
-            hour_utc=hour_utc,
-        )
-
-        for row, col, lat, lon in config.grid_coordinates():
-
-            colour, confidence = (
-                self.sample_grid_point(
-                    panel,
-                    config,
-                    row,
-                    col,
-                )
-            )
-
-            point = HAPGridPoint(
-                row=row,
-                col=col,
-                latitude=lat,
-                longitude=lon,
-                rgb=colour,
-                confidence=confidence,
-            )
-
-            if colour in HAP_COLOURS:
-
-                band, frequency = HAP_COLOURS[
-                    colour
-                ]
-
-                point.band = band
-                point.frequency_mhz = frequency
-                point.supported = True
-
-            else:
-
-                point.notes.append(
-                    "No HAP frequency colour detected."
-                )
-
-            result.grid_points.append(
-                point
-            )
-
-        result.decoding_success = True
-
-        return result
-
-    # ------------------------------------------------------------------------
-    # PAGE → HOURS
-    # ------------------------------------------------------------------------
-
-    def decode_page(
-        self,
-        image_path: Path,
-        page_index: int,
-        config: HAPConfig,
-    ) -> dict[int, HAPHourResult]:
-        """
-        Decode one HAP page.
-
-        Page numbering:
-
-            1 = 00-05 UTC
-            2 = 06-11 UTC
-            3 = 12-17 UTC
-            4 = 18-23 UTC
-        """
-
-        image = Image.open(
-            image_path
-        )
-
-        panels = self.extract_hour_panels(
-            image
-        )
-
-        starting_hour = (
-            page_index - 1
-        ) * 6
-
-        results = {}
-
-        for panel_index, panel in panels.items():
-
-            hour = (
-                starting_hour
-                + panel_index
-            )
-
-            results[hour] = (
-                self.decode_panel(
-                    panel,
-                    config,
-                    hour,
-                )
-            )
-
-            results[hour].image_path = (
-                image_path
-            )
-
-        return results
-
-    # ------------------------------------------------------------------------
-    # FULL COLLECTION
+    # Collect all 24 hours
     # ------------------------------------------------------------------------
 
     def collect(
         self,
         config: HAPConfig,
         timestamp_utc: Optional[datetime] = None,
-    ) -> HAPFrequencyResult:
-        """
-        Generate, download and decode the HAP for a location.
-        """
+    ) -> dict[int, HAPHourResult]:
 
         if timestamp_utc is None:
 
@@ -958,151 +595,539 @@ class HAPCollector:
                 timezone.utc
             )
 
-        timestamp_utc = (
-            timestamp_utc.astimezone(
-                timezone.utc
+        url = self.build_request_url(
+            config,
+            timestamp_utc,
+        )
+
+        print()
+        print(
+            "HAP request:"
+        )
+
+        print(url)
+
+        html = self.fetch_hap_page(
+            url
+        )
+
+        image_urls = (
+            self.extract_image_urls(
+                html
             )
         )
 
-        result = HAPFrequencyResult(
-            config=config,
-            source_url=None,
-            retrieved_utc=datetime.now(
-                timezone.utc
+        if not image_urls:
+
+            raise RuntimeError(
+                "SWS HAP returned no image URLs."
+            )
+
+        print()
+        print(
+            f"Found {len(image_urls)} HAP pages."
+        )
+
+        results = {}
+
+        for page_index, image_url in enumerate(
+            image_urls,
+            start=1,
+        ):
+
+            print(
+                f"Downloading HAP page "
+                f"{page_index}/{len(image_urls)}..."
+            )
+
+            image_path = (
+                self.download_image(
+                    image_url
+                )
+            )
+
+            image = Image.open(
+                image_path
+            )
+
+            panels = (
+                self.extract_hour_panels(
+                    image
+                )
+            )
+
+            first_hour = (
+                (page_index - 1)
+                * 6
+            )
+
+            for panel_index, panel in panels.items():
+
+                hour = (
+                    first_hour
+                    + panel_index
+                )
+
+                results[hour] = (
+                    HAPHourResult(
+                        hour_utc=hour,
+                        panel=panel,
+                    )
+                )
+
+        return results
+
+
+# ============================================================================
+# HAP DECODER
+# ============================================================================
+
+class HAPDecoder:
+
+    def __init__(
+        self,
+        config: HAPConfig,
+    ) -> None:
+
+        self.config = config
+
+        self.grid = (
+            HAPCollector.build_grid(
+                config
+            )
+        )
+
+    # ------------------------------------------------------------------------
+    # RGB -> frequency
+    # ------------------------------------------------------------------------
+
+    @staticmethod
+    def colour_to_frequency(
+        rgb: tuple[int, int, int],
+    ) -> Optional[int]:
+
+        return HAP_COLOURS.get(
+            rgb
+        )
+
+    # ------------------------------------------------------------------------
+    # Frequency -> band
+    # ------------------------------------------------------------------------
+
+    @staticmethod
+    def frequency_to_band(
+        frequency_khz: Optional[int],
+    ) -> Optional[str]:
+
+        if frequency_khz is None:
+
+            return None
+
+        return FREQUENCY_TO_BAND.get(
+            frequency_khz
+        )
+
+    # ------------------------------------------------------------------------
+    # Sample point
+    # ------------------------------------------------------------------------
+
+    @staticmethod
+    def sample_point(
+        panel: Image.Image,
+        point: HAPGridPoint,
+        radius: int = 2,
+    ) -> tuple[
+        Optional[int],
+        int,
+    ]:
+
+        """
+        Sample a small neighbourhood around a geographic point.
+
+        The dominant recognised HAP colour is returned.
+
+        sample_support is the number of pixels supporting that colour.
+
+        This is a decoder quality metric only. It is NOT propagation
+        confidence.
+        """
+
+        image = panel.convert(
+            "RGB"
+        )
+
+        centre_x = round(
+            point.pixel_x
+        )
+
+        centre_y = round(
+            point.pixel_y
+        )
+
+        counts = {}
+
+        for y in range(
+            centre_y - radius,
+            centre_y + radius + 1,
+        ):
+
+            if (
+                y < 0
+                or y >= image.height
+            ):
+
+                continue
+
+            for x in range(
+                centre_x - radius,
+                centre_x + radius + 1,
+            ):
+
+                if (
+                    x < 0
+                    or x >= image.width
+                ):
+
+                    continue
+
+                rgb = image.getpixel(
+                    (x, y)
+                )
+
+                frequency = (
+                    HAP_COLOURS.get(
+                        rgb
+                    )
+                )
+
+                if frequency is None:
+
+                    continue
+
+                counts[rgb] = (
+                    counts.get(
+                        rgb,
+                        0,
+                    )
+                    + 1
+                )
+
+        if not counts:
+
+            return None, 0
+
+        dominant_colour = max(
+            counts,
+            key=counts.get,
+        )
+
+        frequency = (
+            HAP_COLOURS[
+                dominant_colour
+            ]
+        )
+
+        return (
+            frequency,
+            counts[
+                dominant_colour
+            ],
+        )
+
+    # ------------------------------------------------------------------------
+    # Decode one hour
+    # ------------------------------------------------------------------------
+
+    def decode_hour(
+        self,
+        hour_result: HAPHourResult,
+    ) -> list[HAPRecommendation]:
+
+        results = []
+
+        for point in self.grid:
+
+            frequency, support = (
+                self.sample_point(
+                    hour_result.panel,
+                    point,
+                )
+            )
+
+            band = (
+                self.frequency_to_band(
+                    frequency
+                )
+            )
+
+            results.append(
+                HAPRecommendation(
+                    hour_utc=hour_result.hour_utc,
+
+                    row=point.row,
+                    col=point.col,
+
+                    latitude=point.latitude,
+                    longitude=point.longitude,
+
+                    band=band,
+                    frequency_khz=frequency,
+
+                    pixel_x=point.pixel_x,
+                    pixel_y=point.pixel_y,
+
+                    sample_support=support,
+                )
+            )
+
+        return results
+
+    # ------------------------------------------------------------------------
+    # Decode all hours
+    # ------------------------------------------------------------------------
+
+    def decode_all(
+        self,
+        hap_hours: dict[int, HAPHourResult],
+    ) -> dict[
+        int,
+        list[HAPRecommendation],
+    ]:
+
+        decoded = {}
+
+        for hour in sorted(
+            hap_hours
+        ):
+
+            decoded[hour] = (
+                self.decode_hour(
+                    hap_hours[hour]
+                )
+            )
+
+        return decoded
+
+    # ------------------------------------------------------------------------
+    # Find nearest grid point
+    # ------------------------------------------------------------------------
+
+    def nearest_grid_point(
+        self,
+        latitude: float,
+        longitude: float,
+    ) -> HAPGridPoint:
+
+        return min(
+            self.grid,
+            key=lambda point: (
+                (point.latitude - latitude) ** 2
+                +
+                (point.longitude - longitude) ** 2
             ),
         )
 
-        try:
+    # ------------------------------------------------------------------------
+    # Get recommendation for arbitrary coordinate
+    # ------------------------------------------------------------------------
 
-            url = self.build_hap_url(
-                config,
-                timestamp_utc,
+    def get_at_location(
+        self,
+        decoded: dict[
+            int,
+            list[HAPRecommendation],
+        ],
+        latitude: float,
+        longitude: float,
+        hour_utc: int,
+    ) -> Optional[HAPRecommendation]:
+
+        if hour_utc not in decoded:
+
+            return None
+
+        point = (
+            self.nearest_grid_point(
+                latitude,
+                longitude,
             )
+        )
 
-            result.source_url = url
+        for result in decoded[
+            hour_utc
+        ]:
 
-            print(
-                "HAP request:"
-            )
-            print(
-                url
-            )
-
-            html = self.download_hap_html(
-                config,
-                timestamp_utc,
-            )
-
-            image_urls = (
-                self.extract_image_urls(
-                    html
-                )
-            )
-
-            if len(image_urls) < 4:
-
-                raise RuntimeError(
-                    "Expected four HAP GIF pages "
-                    f"but found {len(image_urls)}."
-                )
-
-            image_urls = image_urls[:4]
-
-            for page_number, image_url in enumerate(
-                image_urls,
-                start=1,
+            if (
+                result.row == point.row
+                and
+                result.col == point.col
             ):
 
-                print(
-                    f"Downloading HAP page "
-                    f"{page_number}/4..."
-                )
+                return result
 
-                image_path = (
-                    self.download_image(
-                        image_url
-                    )
-                )
+        return None
 
-                hourly = (
-                    self.decode_page(
-                        image_path,
-                        page_number,
-                        config,
-                    )
-                )
+    # ------------------------------------------------------------------------
+    # Get base recommendation
+    # ------------------------------------------------------------------------
 
-                for hour, hour_result in hourly.items():
+    def get_base_recommendation(
+        self,
+        decoded: dict[
+            int,
+            list[HAPRecommendation],
+        ],
+        hour_utc: int,
+    ) -> Optional[HAPRecommendation]:
 
-                    hour_result.image_url = (
-                        image_url
-                    )
-
-                    result.hourly[hour] = (
-                        hour_result
-                    )
-
-            result.success = True
-
-        except Exception as exc:
-
-            result.success = False
-            result.error = str(exc)
-
-        return result
-
-
-# ============================================================================
-# PUBLIC API
-# ============================================================================
-
-def collect_hap_data(
-    latitude: float,
-    longitude: float,
-    base_name: str = "Base",
-    timestamp_utc: Optional[datetime] = None,
-) -> HAPFrequencyResult:
-    """
-    Public helper used by main.py and future Discord/API code.
-    """
-
-    config = HAPConfig(
-        latitude=latitude,
-        longitude=longitude,
-        base_name=base_name,
-    )
-
-    collector = HAPCollector()
-
-    return collector.collect(
-        config,
-        timestamp_utc,
-    )
-
-
-# ============================================================================
-# DEBUG / VALIDATION OUTPUT
-# ============================================================================
-
-def print_hap_grid(
-    result: HAPFrequencyResult,
-    hour: int,
-) -> None:
-    """
-    Print a decoded HAP grid for one UTC hour.
-    """
-
-    if hour not in result.hourly:
-
-        print(
-            f"No HAP data available for {hour:02d} UTC."
+        return self.get_at_location(
+            decoded=decoded,
+            latitude=self.config.base_lat,
+            longitude=self.config.base_lon,
+            hour_utc=hour_utc,
         )
+
+    # ------------------------------------------------------------------------
+    # Get complete base forecast
+    # ------------------------------------------------------------------------
+
+    def get_base_forecast(
+        self,
+        decoded: dict[
+            int,
+            list[HAPRecommendation],
+        ],
+    ) -> dict[
+        int,
+        Optional[HAPRecommendation],
+    ]:
+
+        forecast = {}
+
+        for hour in sorted(
+            decoded
+        ):
+
+            forecast[hour] = (
+                self.get_base_recommendation(
+                    decoded,
+                    hour,
+                )
+            )
+
+        return forecast
+
+    # ------------------------------------------------------------------------
+    # Regional band distribution
+    # ------------------------------------------------------------------------
+
+    def get_regional_distribution(
+        self,
+        decoded: dict[
+            int,
+            list[HAPRecommendation],
+        ],
+        hour_utc: int,
+    ) -> dict[str, int]:
+
+        counts = {
+            band: 0
+            for band in BANDS
+        }
+
+        if hour_utc not in decoded:
+
+            return counts
+
+        for result in decoded[
+            hour_utc
+        ]:
+
+            if result.band in counts:
+
+                counts[
+                    result.band
+                ] += 1
+
+        return counts
+
+
+# ============================================================================
+# PRINTING
+# ============================================================================
+
+def print_geometry(
+    decoder: HAPDecoder,
+) -> None:
+
+    print()
+    print(
+        "=" * 78
+    )
+
+    print(
+        "HAP GEOGRAPHIC → PIXEL GEOMETRY"
+    )
+
+    print(
+        "=" * 78
+    )
+
+    print()
+
+    print(
+        f"Map X range: "
+        f"{HAP_MAP_X_MIN} → "
+        f"{HAP_MAP_X_MAX}"
+    )
+
+    print(
+        f"Map Y range: "
+        f"{HAP_MAP_Y_MIN} → "
+        f"{HAP_MAP_Y_MAX}"
+    )
+
+    print(
+        f"Boundary inset: "
+        f"{EDGE_INSET}px"
+    )
+
+    print()
+
+    centre = (
+        decoder.nearest_grid_point(
+            decoder.config.base_lat,
+            decoder.config.base_lon,
+        )
+    )
+
+    print(
+        "Base grid point:"
+    )
+
+    print(
+        f"  Geographic: "
+        f"{centre.latitude:.4f}, "
+        f"{centre.longitude:.4f}"
+    )
+
+    print(
+        f"  Pixel: "
+        f"({centre.pixel_x:.1f}, "
+        f"{centre.pixel_y:.1f})"
+    )
+
+
+def print_grid(
+    decoder: HAPDecoder,
+    recommendations: list[HAPRecommendation],
+) -> None:
+
+    if not recommendations:
 
         return
 
-    hourly = result.hourly[hour]
-
-    config = result.config
+    hour = recommendations[0].hour_utc
 
     print()
     print(
@@ -1119,24 +1144,24 @@ def print_hap_grid(
 
     print()
 
-    # Longitude header.
-
     print(
         "Latitude \\ Longitude",
-        end=" "
+        end="   ",
     )
 
     for col in range(
-        config.grid_cols
+        decoder.config.ncols
     ):
 
-        lon = config.grid_longitude(
-            col
+        longitude = (
+            decoder.config.nw_lon
+            + col
+            * decoder.config.step_lon
         )
 
         print(
-            f"{lon:>8.2f}",
-            end=""
+            f"{longitude:8.2f}",
+            end="",
         )
 
     print()
@@ -1145,101 +1170,98 @@ def print_hap_grid(
         "-" * 78
     )
 
-    points = {
-        (
-            point.row,
-            point.col,
-        ): point
-        for point in hourly.grid_points
-    }
-
     for row in range(
-        config.grid_rows
+        decoder.config.nrows
     ):
 
-        lat = config.grid_latitude(
-            row
+        latitude = (
+            decoder.config.nw_lat
+            - row
+            * decoder.config.step_lat
         )
 
         print(
-            f"{lat:>8.2f}",
-            end=" "
+            f"{latitude:8.2f}",
+            end="",
         )
 
-        for col in range(
-            config.grid_cols
-        ):
+        row_results = [
+            result
+            for result in recommendations
+            if result.row == row
+        ]
 
-            point = points.get(
-                (row, col)
+        row_results.sort(
+            key=lambda result: result.col
+        )
+
+        for result in row_results:
+
+            value = (
+                result.band
+                if result.band is not None
+                else "--"
             )
 
-            if point is None:
-
-                label = "?"
-
-            elif point.band:
-
-                label = point.band
-
-            else:
-
-                label = "--"
-
             print(
-                f"{label:>8}",
-                end=""
+                f"{value:>10}",
+                end="",
             )
 
         print()
 
-    print()
-
-    print(
-        "Base location:"
-    )
-
-    print(
-        f"  {config.base_name}"
-    )
-
-    print(
-        f"  Latitude : {config.latitude:.4f}"
-    )
-
-    print(
-        f"  Longitude: {config.longitude:.4f}"
+    base = (
+        decoder.get_base_recommendation(
+            {
+                hour: recommendations
+            },
+            hour,
+        )
     )
 
     print()
 
-    print(
-        "Centre grid point:"
-    )
+    if base is None:
 
-    print(
-        f"  Row: {config.centre_row}"
-    )
+        print(
+            "Base location: no decoded HAP result"
+        )
 
-    print(
-        f"  Col: {config.centre_col}"
-    )
+    elif base.band is None:
 
-    print(
-        f"  Lat: {config.grid_latitude(config.centre_row):.4f}"
-    )
+        print(
+            "Base location: no recognised HAP frequency"
+        )
 
-    print(
-        f"  Lon: {config.grid_longitude(config.centre_col):.4f}"
-    )
+    else:
+
+        print(
+            "Base location:"
+        )
+
+        print(
+            f"  {decoder.config.base_name}"
+        )
+
+        print(
+            f"  HAP recommendation: "
+            f"{base.band} "
+            f"({base.frequency_khz / 1000:.3f} MHz)"
+        )
+
+        print(
+            f"  Sample support: "
+            f"{base.sample_support}"
+        )
 
 
-def print_hap_summary(
-    result: HAPFrequencyResult,
+def print_base_forecast(
+    decoder: HAPDecoder,
+    decoded: dict[
+        int,
+        list[HAPRecommendation],
+    ],
 ) -> None:
-    """
-    Print a compact summary of all decoded HAP hours.
-    """
 
     print()
     print(
@@ -1247,40 +1269,142 @@ def print_hap_summary(
     )
 
     print(
-        "HAP FREQUENCY SUMMARY"
+        "HAP BASE LOCATION — 24 HOUR FORECAST"
     )
 
     print(
         "=" * 78
+    )
+
+    print()
+
+    print(
+        f"Base: {decoder.config.base_name}"
+    )
+
+    print(
+        f"Latitude: "
+        f"{decoder.config.base_lat:.4f}"
+    )
+
+    print(
+        f"Longitude: "
+        f"{decoder.config.base_lon:.4f}"
+    )
+
+    print()
+
+    print(
+        f"{'UTC':>5}  "
+        f"{'Band':>6}  "
+        f"{'Frequency':>12}  "
+        f"{'Support':>8}"
+    )
+
+    print(
+        "-" * 48
+    )
+
+    forecast = (
+        decoder.get_base_forecast(
+            decoded
+        )
+    )
+
+    for hour, result in forecast.items():
+
+        if result is None:
+
+            print(
+                f"{hour:02d}     "
+                f"{'--':>6}  "
+                f"{'--':>12}  "
+                f"{'--':>8}"
+            )
+
+            continue
+
+        if result.band is None:
+
+            print(
+                f"{hour:02d}     "
+                f"{'--':>6}  "
+                f"{'--':>12}  "
+                f"{result.sample_support:>8}"
+            )
+
+            continue
+
+        print(
+            f"{hour:02d}     "
+            f"{result.band:>6}  "
+            f"{result.frequency_khz / 1000:>9.3f} MHz  "
+            f"{result.sample_support:>8}"
+        )
+
+
+def print_regional_summary(
+    decoder: HAPDecoder,
+    decoded: dict[
+        int,
+        list[HAPRecommendation],
+    ],
+) -> None:
+
+    print()
+    print(
+        "=" * 78
+    )
+
+    print(
+        "REGIONAL HAP DISTRIBUTION"
+    )
+
+    print(
+        "=" * 78
+    )
+
+    print()
+
+    total = (
+        decoder.config.nrows
+        * decoder.config.ncols
     )
 
     for hour in sorted(
-        result.hourly
+        decoded
     ):
 
-        hourly = result.hourly[
-            hour
-        ]
-
-        counts = hourly.band_counts()
-
-        print()
-
-        print(
-            f"{hour:02d} UTC"
+        distribution = (
+            decoder.get_regional_distribution(
+                decoded,
+                hour,
+            )
         )
 
-        for band, frequency in BANDS.items():
-
-            count = counts.get(
+        active = [
+            (
                 band,
-                0,
+                count,
             )
+            for band, count
+            in distribution.items()
+            if count > 0
+        ]
 
-            total = (
-                result.config.grid_rows
-                * result.config.grid_cols
-            )
+        active.sort(
+            key=lambda item: item[1],
+            reverse=True,
+        )
+
+        print(
+            f"{hour:02d} UTC:",
+            end=" ",
+        )
+
+        parts = []
+
+        for band, count in active:
 
             percentage = (
                 count
@@ -1288,464 +1412,253 @@ def print_hap_summary(
                 * 100
             )
 
-            print(
-                f"  {band:>4} "
-                f"{frequency:>7.3f} MHz : "
-                f"{count:2d}/{total} "
-                f"grid points "
-                f"({percentage:5.1f}%)"
+            parts.append(
+                f"{band} "
+                f"{count}/{total} "
+                f"({percentage:.0f}%)"
             )
 
+        print(
+            " | ".join(parts)
+        )
+
 
 # ============================================================================
-# STANDALONE TEST
+# MAIN TEST
 # ============================================================================
 
-if __name__ == "__main__":
-
-    print(
-        "=" * 78
-    )
-
-    print(
-        "SWS HAP CENTRED DECODER TEST"
-    )
-
-    print(
-        "=" * 78
-    )
+def main() -> None:
 
     print()
+    print(
+        "=" * 78
+    )
+
+    print(
+        "RADIOPATHWAYTOOL — SWS HAP ENGINE"
+    )
+
+    print(
+        "=" * 78
+    )
 
     # ------------------------------------------------------------------------
-    # TEST LOCATION
+    # Nelson
     # ------------------------------------------------------------------------
-    #
-    # Nelson, NZ.
-    #
-    # The HAP grid will automatically be calculated around this location.
-
-    latitude = -41.27
-    longitude = 173.28
 
     base_name = "Nelson"
 
-    print(
-        f"Location: {base_name}"
-    )
+    base_lat = -41.27
 
-    print(
-        f"Latitude : {latitude}"
-    )
+    base_lon = 173.28
 
-    print(
-        f"Longitude: {longitude}"
+    collector = HAPCollector()
+
+    config = (
+        collector.create_centred_config(
+            base_name=base_name,
+            base_lat=base_lat,
+            base_lon=base_lon,
+            nrows=7,
+            ncols=7,
+            step_lat=5.0,
+            step_lon=5.0,
+        )
     )
 
     print()
 
-    config = HAPConfig(
-        latitude=latitude,
-        longitude=longitude,
-        base_name=base_name,
+    print(
+        "Location:"
     )
 
     print(
-        "Calculated HAP geographic grid:"
+        f"  {base_name}"
+    )
+
+    print(
+        f"  Latitude : "
+        f"{base_lat:.4f}"
+    )
+
+    print(
+        f"  Longitude: "
+        f"{base_lon:.4f}"
+    )
+
+    print()
+
+    print(
+        "Calculated geographic grid:"
     )
 
     print(
         f"  NW latitude : "
-        f"{config.nw_latitude:.4f}"
+        f"{config.nw_lat:.4f}"
     )
 
     print(
         f"  NW longitude: "
-        f"{config.nw_longitude:.4f}"
+        f"{config.nw_lon:.4f}"
     )
 
     print(
         f"  Step        : "
-        f"{config.grid_step_lat}° / "
-        f"{config.grid_step_lon}°"
+        f"{config.step_lat}° / "
+        f"{config.step_lon}°"
     )
 
     print(
         f"  Grid        : "
-        f"{config.grid_rows} × "
-        f"{config.grid_cols}"
+        f"{config.nrows} × "
+        f"{config.ncols}"
     )
 
     print(
-        f"  Centre      : "
-        f"row {config.centre_row}, "
-        f"col {config.centre_col}"
+        f"  Centre      : row "
+        f"{config.nrows // 2}, col "
+        f"{config.ncols // 2}"
     )
 
-    print()
+    # ------------------------------------------------------------------------
+    # Decoder
+    # ------------------------------------------------------------------------
 
+    decoder = HAPDecoder(
+        config
+    )
+
+    print_geometry(
+        decoder
+    )
+
+    # ------------------------------------------------------------------------
+    # Collect
+    # ------------------------------------------------------------------------
+
+    print()
     print(
         "Collecting HAP data..."
     )
 
-    print()
+    try:
 
-    collector = HAPCollector()
+        hap_hours = collector.collect(
+            config
+        )
 
-    result = collector.collect(
-        config
-    )
-
-    if not result.success:
+    except Exception as exc:
 
         print()
-
         print(
-            "HAP COLLECTION FAILED"
+            "HAP collection failed:"
         )
 
         print(
-            f"Error: {result.error}"
+            f"  {exc}"
         )
 
         raise SystemExit(1)
 
     print()
-
     print(
         "HAP collection successful."
     )
 
     print(
         f"Decoded hours: "
-        f"{len(result.hourly)}"
+        f"{len(hap_hours)}"
     )
 
     # ------------------------------------------------------------------------
-    # Print the 12 UTC grid.
+    # Decode
     # ------------------------------------------------------------------------
 
-    if 12 in result.hourly:
-
-        print_hap_grid(
-            result,
-            12,
+    decoded = (
+        decoder.decode_all(
+            hap_hours
         )
+    )
 
     # ------------------------------------------------------------------------
-    # Print the 15 UTC grid.
+    # Show key daylight examples
     # ------------------------------------------------------------------------
 
-    if 15 in result.hourly:
-
-        print_hap_grid(
-            result,
-            15,
-        )
-
-    # ------------------------------------------------------------------------
-    # Print all-hour summary.
-    # ------------------------------------------------------------------------
-
-    print_hap_summary(
-        result
-    )
-
-    print()
-
-    print(
-        "=" * 78
-    )
-
-    print(
-        "DONE"
-    )
-
-    print(
-        "=" * 78
-    )
-
-
-# ============================================================================
-# HAP PIXEL MAP DIAGNOSTIC
-# ============================================================================
-
-def print_hap_pixel_map(
-    image_path: Path,
-    page_index: int = 3,
-    hour_in_page: int = 3,
-    step: int = 4,
-) -> None:
-    """
-    Print a coarse ASCII representation of an HAP map.
-
-    page_index:
-        1 = 00-05 UTC
-        2 = 06-11 UTC
-        3 = 12-17 UTC
-        4 = 18-23 UTC
-
-    hour_in_page:
-        0-5
-
-    step:
-        Number of source pixels represented by one ASCII character.
-
-    This is purely a diagnostic tool. It is NOT the final decoder.
-    """
-
-    image = Image.open(image_path)
-
-    panels = HAPCollector().extract_hour_panels(image)
-
-    if hour_in_page not in panels:
-        print(
-            f"Invalid hour_in_page: {hour_in_page}"
-        )
-        return
-
-    panel = panels[hour_in_page].convert("RGB")
-
-    colour_chars = {
-        (255, 255, 0): "Y",      # 160m
-        (255, 0, 0): "R",        # 80m
-        (128, 128, 0): "O",      # 40m
-        (0, 128, 0): "G",        # 30m
-        (0, 255, 255): "C",      # 20m
-        (0, 255, 0): "L",        # 17m
-        (0, 128, 128): "T",      # 15m
-        (0, 0, 255): "B",        # 12m
-        (0, 0, 128): "N",        # 10m
-        (255, 255, 255): ".",    # white/background
-        (0, 0, 0): "#",          # black/border/text
-    }
-
-    width, height = panel.size
-
-    print()
-    print("=" * 100)
-    print("HAP PIXEL MAP DIAGNOSTIC")
-    print("=" * 100)
-
-    print()
-    print(
-        f"Image: {image_path}"
-    )
-
-    print(
-        f"Panel: {width} × {height}"
-    )
-
-    actual_hour = (
-        (page_index - 1) * 6
-        + hour_in_page
-    )
-
-    print(
-        f"UTC hour: {actual_hour:02d}"
-    )
-
-    print(
-        f"Pixel sampling step: {step}"
-    )
-
-    print()
-
-    print(
-        "Legend:"
-    )
-
-    print(
-        "  Y = 160m   R = 80m   O = 40m   G = 30m   C = 20m"
-    )
-
-    print(
-        "  L = 17m    T = 15m   B = 12m   N = 10m"
-    )
-
-    print(
-        "  . = white/background"
-    )
-
-    print(
-        "  # = black/border/text"
-    )
-
-    print()
-
-    # ------------------------------------------------------------------------
-    # Print column coordinate markers.
-    # ------------------------------------------------------------------------
-
-    print(
-        "X coordinate:"
-    )
-
-    print(
-        "    ",
-        end=""
-    )
-
-    for x in range(
-        0,
-        width,
-        step,
+    for hour in (
+        12,
+        15,
     ):
 
-        print(
-            str(x // 100 % 10),
-            end=""
-        )
+        if hour in decoded:
 
-    print()
-
-    print(
-        "    ",
-        end=""
-    )
-
-    for x in range(
-        0,
-        width,
-        step,
-    ):
-
-        print(
-            str(x // 10 % 10),
-            end=""
-        )
-
-    print()
-
-    print(
-        "    ",
-        end=""
-    )
-
-    for x in range(
-        0,
-        width,
-        step,
-    ):
-
-        print(
-            str(x % 10),
-            end=""
-        )
-
-    print()
-
-    # ------------------------------------------------------------------------
-    # Sample image.
-    #
-    # Instead of taking the first pixel in each block, count the colours
-    # inside the block and use the dominant recognised HAP colour.
-    # ------------------------------------------------------------------------
-
-    for y in range(
-        0,
-        height,
-        step,
-    ):
-
-        print(
-            f"{y:03d} ",
-            end=""
-        )
-
-        for x in range(
-            0,
-            width,
-            step,
-        ):
-
-            counts = {}
-
-            for yy in range(
-                y,
-                min(y + step, height),
-            ):
-
-                for xx in range(
-                    x,
-                    min(x + step, width),
-                ):
-
-                    rgb = panel.getpixel(
-                        (xx, yy)
-                    )
-
-                    if rgb in colour_chars:
-
-                        counts[rgb] = (
-                            counts.get(rgb, 0)
-                            + 1
-                        )
-
-            if not counts:
-
-                char = " "
-
-            else:
-
-                dominant = max(
-                    counts,
-                    key=counts.get,
-                )
-
-                char = colour_chars[
-                    dominant
-                ]
-
-            print(
-                char,
-                end=""
+            print_grid(
+                decoder,
+                decoded[hour],
             )
 
-        print()
+    # ------------------------------------------------------------------------
+    # 24-hour base forecast
+    # ------------------------------------------------------------------------
+
+    print_base_forecast(
+        decoder,
+        decoded,
+    )
+
+    # ------------------------------------------------------------------------
+    # Regional distribution
+    # ------------------------------------------------------------------------
+
+    print_regional_summary(
+        decoder,
+        decoded,
+    )
+
+    # ------------------------------------------------------------------------
+    # Final
+    # ------------------------------------------------------------------------
+
+    print()
+    print(
+        "=" * 78
+    )
+
+    print(
+        "HAP ENGINE COMPLETE"
+    )
+
+    print(
+        "=" * 78
+    )
 
     print()
 
-    print("=" * 100)
-    print("END PIXEL MAP")
-    print("=" * 100)
+    print(
+        "HAP is now exposed as structured propagation data."
+    )
+
+    print()
+
+    print(
+        "Next integration:"
+    )
+
+    print(
+        "  HAP"
+        " + "
+        "SWS ionosphere"
+        " + "
+        "space weather"
+        " + "
+        "data age"
+    )
+
     print()
 
 
 # ============================================================================
-# RUN PIXEL MAP TEST
+# ENTRY POINT
 # ============================================================================
 
 if __name__ == "__main__":
-
-    # Find the most recently cached GIF.
-    #
-    # This is only for diagnostics. We will replace this with a proper
-    # reference to the page returned by the collector later.
-
-    cache_files = sorted(
-        CACHE_DIR.glob("*.gif"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-
-    if not cache_files:
-
-        print(
-            "No cached HAP GIFs found."
-        )
-
-        print(
-            "Run the HAP collection test first."
-        )
-
-        raise SystemExit(1)
-
-    image_path = cache_files[0]
-
-    print_hap_pixel_map(
-        image_path=image_path,
-        page_index=3,
-        hour_in_page=3,
-        step=10,
-    )
+    main()
