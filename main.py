@@ -13,15 +13,14 @@ Architecture:
     band_favorability.py
             |
             v
-       main.py
+         main.py
             |
             +--> structured propagation report
             |
             +--> human-readable text
             |
             v
-       discord_bot.py
-
+      discord_bot.py
 
 Important design principles:
 
@@ -37,9 +36,10 @@ Important design principles:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
+import re
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +48,6 @@ from typing import Any, Optional
 
 from space_weather import collect_space_weather
 from ionosphere import get_all_ionosphere_observations
-
 from band_favorability import (
     HAPCollector,
     HAPDecoder,
@@ -63,10 +62,11 @@ from band_favorability import (
 LOCATION_NAME = "Nelson"
 
 LOCATION_LATITUDE = -41.27
+
 LOCATION_LONGITUDE = 173.28
 
-# The HAP system currently uses the nine frequencies supplied to the SWS
-# prediction tool.
+# The HAP system currently uses the nine frequencies supplied to the
+# SWS prediction tool.
 HAP_FREQUENCIES_KHZ = [
     1838,
     3650,
@@ -82,6 +82,7 @@ HAP_FREQUENCIES_KHZ = [
 # How many degrees around the requested location should the HAP grid cover.
 HAP_GRID_ROWS = 7
 HAP_GRID_COLS = 7
+
 HAP_GRID_STEP_LAT = 5.0
 HAP_GRID_STEP_LON = 5.0
 
@@ -89,7 +90,6 @@ HAP_GRID_STEP_LON = 5.0
 # ---------------------------------------------------------------------------
 # DATA CLASSES
 # ---------------------------------------------------------------------------
-
 
 @dataclass
 class DataStatus:
@@ -147,7 +147,6 @@ class PropagationReport:
 # TIME HELPERS
 # ---------------------------------------------------------------------------
 
-
 def get_current_utc() -> datetime:
     """
     Return the current timezone-aware UTC datetime.
@@ -167,7 +166,9 @@ def format_local_time(dt: datetime) -> str:
     try:
         from zoneinfo import ZoneInfo
 
-        nz_time = dt.astimezone(ZoneInfo("Pacific/Auckland"))
+        nz_time = dt.astimezone(
+            ZoneInfo("Pacific/Auckland")
+        )
 
         return nz_time.strftime(
             "%d %b %Y %H:%M NZ"
@@ -175,15 +176,18 @@ def format_local_time(dt: datetime) -> str:
 
     except Exception:
         # Fallback if zoneinfo is unavailable.
-        return dt.strftime("%d %b %Y %H:%M UTC")
+        return dt.strftime(
+            "%d %b %Y %H:%M UTC"
+        )
 
 
 # ---------------------------------------------------------------------------
 # HAP HELPERS
 # ---------------------------------------------------------------------------
 
-
-def create_hap_config(current_time: datetime) -> HAPConfig:
+def create_hap_config(
+    current_time: datetime,
+) -> HAPConfig:
     """
     Create the HAP configuration centred on Nelson.
 
@@ -202,26 +206,35 @@ def create_hap_config(current_time: datetime) -> HAPConfig:
     )
 
 
-def collect_hap(current_time: datetime) -> tuple[Any, Any]:
+def collect_hap(
+    current_time: datetime,
+) -> tuple[Any, Any]:
     """
     Collect and decode the complete HAP forecast.
 
     Returns:
-
         (config, decoded_hap)
 
     Raises an exception if the HAP system cannot be collected.
     """
 
-    config = create_hap_config(current_time)
+    config = create_hap_config(
+        current_time
+    )
 
     collector = HAPCollector()
 
-    hap_data = collector.collect(config)
+    hap_data = collector.collect(
+        config
+    )
 
-    decoder = HAPDecoder(config)
+    decoder = HAPDecoder(
+        config
+    )
 
-    decoded_hap = decoder.decode_all(hap_data)
+    decoded_hap = decoder.decode_all(
+        hap_data
+    )
 
     return config, decoded_hap
 
@@ -246,12 +259,15 @@ def extract_hap_base_recommendation(
     decoder: HAPDecoder,
     decoded_hap: Any,
     hour_utc: int,
-) -> tuple[Optional[str], Optional[float], Optional[int]]:
+) -> tuple[
+    Optional[str],
+    Optional[float],
+    Optional[int],
+]:
     """
     Extract the HAP recommendation for the Nelson base point.
 
     Returns:
-
         band
         frequency MHz
         support
@@ -260,6 +276,7 @@ def extract_hap_base_recommendation(
     """
 
     try:
+
         recommendation = decoder.get_base_recommendation(
             decoded=decoded_hap,
             hour_utc=hour_utc,
@@ -314,6 +331,7 @@ def extract_regional_distribution(
     """
 
     try:
+
         distribution = decoder.get_regional_distribution(
             decoded=decoded_hap,
             hour_utc=hour_utc,
@@ -335,7 +353,11 @@ def find_next_hap_transition(
     decoder: HAPDecoder,
     decoded_hap: Any,
     current_hour: int,
-) -> tuple[Optional[int], Optional[str], Optional[float]]:
+) -> tuple[
+    Optional[int],
+    Optional[str],
+    Optional[float],
+]:
     """
     Find the next UTC hour at which the HAP recommendation at the Nelson
     base point changes.
@@ -343,23 +365,25 @@ def find_next_hap_transition(
     Searches forward through the next 23 hours.
 
     Returns:
-
         transition_hour
         band
         frequency MHz
     """
 
     try:
-        current_result = get_hap_hour(
+
+        get_hap_hour(
             decoder,
             decoded_hap,
             current_hour,
         )
 
-        current_band, _, _ = extract_hap_base_recommendation(
-            decoder,
-            decoded_hap,
-            current_hour,
+        current_band, _, _ = (
+            extract_hap_base_recommendation(
+                decoder,
+                decoded_hap,
+                current_hour,
+            )
         )
 
         if current_band is None:
@@ -367,25 +391,31 @@ def find_next_hap_transition(
 
         for offset in range(1, 24):
 
-            hour = (current_hour + offset) % 24
+            hour = (
+                current_hour + offset
+            ) % 24
 
-            result = get_hap_hour(
+            get_hap_hour(
                 decoder,
                 decoded_hap,
                 hour,
             )
 
-            band, frequency_mhz, _ = (
-                    extract_hap_base_recommendation(
+            (
+                band,
+                frequency_mhz,
+                _,
+            ) = extract_hap_base_recommendation(
                 decoder,
                 decoded_hap,
                 hour,
-    )
-)
+            )
+
             if band is None:
                 continue
 
             if band != current_band:
+
                 return (
                     hour,
                     band,
@@ -402,8 +432,9 @@ def find_next_hap_transition(
 # SPACE WEATHER HELPERS
 # ---------------------------------------------------------------------------
 
-
-def build_space_weather_report(weather: Any) -> dict[str, Any]:
+def build_space_weather_report(
+    weather: Any,
+) -> dict[str, Any]:
     """
     Convert SpaceWeatherData into a simple serialisable dictionary.
 
@@ -502,7 +533,6 @@ def build_space_weather_report(weather: Any) -> dict[str, Any]:
 # IONOSPHERE HELPERS
 # ---------------------------------------------------------------------------
 
-
 def build_ionosphere_report(
     observations: dict[str, Any],
 ) -> list[dict[str, Any]]:
@@ -527,18 +557,21 @@ def build_ionosphere_report(
         if percent is not None:
 
             if percent > 0:
+
                 condition_text = (
                     f"{getattr(observation, 'condition', 'unknown')} "
                     f"(+{percent:.0f}%)"
                 )
 
             else:
+
                 condition_text = (
                     f"{getattr(observation, 'condition', 'unknown')} "
                     f"({percent:.0f}%)"
                 )
 
         else:
+
             condition_text = getattr(
                 observation,
                 "condition",
@@ -603,7 +636,6 @@ def build_ionosphere_report(
 # TEXT FORMATTING
 # ---------------------------------------------------------------------------
 
-
 def format_frequency(
     frequency_mhz: Optional[float],
 ) -> str:
@@ -624,12 +656,18 @@ def format_regional_distribution(
     """
 
     if not distribution:
-        return ["No regional HAP distribution available."]
+        return [
+            "No regional HAP distribution available."
+        ]
 
-    total = sum(distribution.values())
+    total = sum(
+        distribution.values()
+    )
 
     if total <= 0:
-        return ["No regional HAP distribution available."]
+        return [
+            "No regional HAP distribution available."
+        ]
 
     # Sort by number of grid points, largest first.
     ordered = sorted(
@@ -664,7 +702,9 @@ def format_ionosphere(
     """
 
     if not observations:
-        return ["No ionospheric observations available."]
+        return [
+            "No ionospheric observations available."
+        ]
 
     usable = [
         observation
@@ -684,7 +724,10 @@ def format_ionosphere(
 
         name = observation.get(
             "station_name",
-            observation.get("station", "Unknown"),
+            observation.get(
+                "station",
+                "Unknown",
+            ),
         )
 
         condition = observation.get(
@@ -699,11 +742,15 @@ def format_ionosphere(
     # Only mention missing stations if there are no usable observations.
     # Otherwise the Discord message can become unnecessarily large.
     if not usable:
+
         for observation in unusable:
 
             name = observation.get(
                 "station_name",
-                observation.get("station", "Unknown"),
+                observation.get(
+                    "station",
+                    "Unknown",
+                ),
             )
 
             condition = observation.get(
@@ -732,6 +779,7 @@ def format_space_weather(
     )
 
     if solar_flux is not None:
+
         lines.append(
             f"F10.7: {solar_flux}"
         )
@@ -741,6 +789,7 @@ def format_space_weather(
     )
 
     if sunspots is not None:
+
         lines.append(
             f"Sunspots: {sunspots}"
         )
@@ -754,10 +803,13 @@ def format_space_weather(
     )
 
     if australian_k is not None:
+
         lines.append(
             f"Australian K: {australian_k}"
         )
+
     elif planetary_k is not None:
+
         lines.append(
             f"Planetary K: {planetary_k}"
         )
@@ -767,6 +819,7 @@ def format_space_weather(
     )
 
     if a_index is not None:
+
         lines.append(
             f"A-index: {a_index}"
         )
@@ -776,12 +829,17 @@ def format_space_weather(
     )
 
     if dst is not None:
+
         lines.append(
             f"Dst: {dst}"
         )
 
     return lines
 
+
+# ---------------------------------------------------------------------------
+# SPACE WEATHER ALERT FORMATTING
+# ---------------------------------------------------------------------------
 
 def extract_alert_message(
     alert: dict[str, Any],
@@ -798,6 +856,7 @@ def extract_alert_message(
         "content",
         "summary",
     ):
+
         value = alert.get(key)
 
         if isinstance(value, str) and value.strip():
@@ -816,7 +875,9 @@ def format_space_weather_alert(
     The full alert remains available in SpaceWeatherData.raw.
     """
 
-    message = extract_alert_message(alert)
+    message = extract_alert_message(
+        alert
+    )
 
     if not message:
         return "Space-weather alert"
@@ -837,6 +898,7 @@ def format_space_weather_alert(
         level = storm_match.group(1).upper()
 
         # Look for a predicted date/level such as:
+        #
         # Sep 24: G1 (Minor)
 
         date_match = re.search(
@@ -928,12 +990,15 @@ def format_space_weather_alert(
     # Fallback
     # ------------------------------------------------------------
 
-    first_line = message.splitlines()[0].strip()
+    first_line = (
+        message.splitlines()[0].strip()
+    )
 
     if first_line:
         return first_line
 
     return "Space-weather alert"
+
 
 def format_space_weather_alerts(
     alerts: list[dict[str, Any]] | None,
@@ -949,7 +1014,10 @@ def format_space_weather_alerts(
 
     for alert in alerts:
 
-        if not isinstance(alert, dict):
+        if not isinstance(
+            alert,
+            dict,
+        ):
             continue
 
         text = format_space_weather_alert(
@@ -960,6 +1028,11 @@ def format_space_weather_alerts(
             formatted.append(text)
 
     return formatted
+
+
+# ---------------------------------------------------------------------------
+# REPORT TEXT
+# ---------------------------------------------------------------------------
 
 def build_report_text(
     report: PropagationReport,
@@ -973,9 +1046,17 @@ def build_report_text(
 
     lines = []
 
-    lines.append("=" * 60)
-    lines.append("RADIOPATHWAYTOOL")
-    lines.append("=" * 60)
+    lines.append(
+        "=" * 60
+    )
+
+    lines.append(
+        "RADIOPATHWAYTOOL"
+    )
+
+    lines.append(
+        "=" * 60
+    )
 
     lines.append(
         f"Location: {report.location_name}"
@@ -997,8 +1078,13 @@ def build_report_text(
     # HAP
     # -----------------------------------------------------------------------
 
-    lines.append("HAP")
-    lines.append("-" * 60)
+    lines.append(
+        "HAP"
+    )
+
+    lines.append(
+        "-" * 60
+    )
 
     if report.data_status.hap_available:
 
@@ -1011,6 +1097,7 @@ def build_report_text(
             )
 
             if report.current_support is not None:
+
                 lines.append(
                     f"Grid support: "
                     f"{report.current_support}/49"
@@ -1047,6 +1134,7 @@ def build_report_text(
         for regional_line in format_regional_distribution(
             report.regional_distribution
         ):
+
             lines.append(
                 f"  {regional_line}"
             )
@@ -1058,8 +1146,10 @@ def build_report_text(
         )
 
         if report.data_status.hap_error:
+
             lines.append(
-                f"Error: {report.data_status.hap_error}"
+                f"Error: "
+                f"{report.data_status.hap_error}"
             )
 
     lines.append("")
@@ -1068,14 +1158,20 @@ def build_report_text(
     # IONOSPHERE
     # -----------------------------------------------------------------------
 
-    lines.append("IONOSPHERE")
-    lines.append("-" * 60)
+    lines.append(
+        "IONOSPHERE"
+    )
+
+    lines.append(
+        "-" * 60
+    )
 
     if report.data_status.ionosphere_available:
 
         for line in format_ionosphere(
             report.ionosphere_observations
         ):
+
             lines.append(
                 f"  {line}"
             )
@@ -1087,6 +1183,7 @@ def build_report_text(
         )
 
         if report.data_status.ionosphere_error:
+
             lines.append(
                 f"  Error: "
                 f"{report.data_status.ionosphere_error}"
@@ -1098,44 +1195,83 @@ def build_report_text(
     # SPACE WEATHER
     # -----------------------------------------------------------------------
 
-    lines.append("SPACE WEATHER")
-    lines.append("-" * 60)
+    lines.append(
+        "SPACE WEATHER"
+    )
+
+    lines.append(
+        "-" * 60
+    )
 
     if report.data_status.space_weather_available:
 
+        # Main measurements
         for line in format_space_weather(
             report.space_weather
         ):
+
             lines.append(
                 f"  {line}"
             )
 
+        # Current NOAA/SWS alerts
         alerts = report.space_weather.get(
             "active_alerts",
             [],
         )
 
+        # Current warnings
         warnings = report.space_weather.get(
             "active_warnings",
             [],
         )
 
-        if alerts:
-            lines.append("")
-            lines.append("  Active alerts:")
+        # ---------------------------------------------------------------
+        # Current watches / alerts
+        # ---------------------------------------------------------------
 
-            for alert in alerts:
+        formatted_alerts = (
+            format_space_weather_alerts(
+                alerts
+            )
+        )
+
+        if formatted_alerts:
+
+            lines.append("")
+
+            lines.append(
+                "  Current watches/alerts:"
+            )
+
+            for alert_text in formatted_alerts:
+
                 lines.append(
-                    f"    - {alert}"
+                    f"    • {alert_text}"
                 )
 
-        if warnings:
-            lines.append("")
-            lines.append("  Active warnings:")
+        # ---------------------------------------------------------------
+        # Current warnings
+        # ---------------------------------------------------------------
 
-            for warning in warnings:
+        formatted_warnings = (
+            format_space_weather_alerts(
+                warnings
+            )
+        )
+
+        if formatted_warnings:
+
+            lines.append("")
+
+            lines.append(
+                "  Current warnings:"
+            )
+
+            for warning_text in formatted_warnings:
+
                 lines.append(
-                    f"    - {warning}"
+                    f"    • {warning_text}"
                 )
 
     else:
@@ -1145,6 +1281,7 @@ def build_report_text(
         )
 
         if report.data_status.space_weather_error:
+
             lines.append(
                 f"  Error: "
                 f"{report.data_status.space_weather_error}"
@@ -1156,8 +1293,13 @@ def build_report_text(
     # DATA STATUS
     # -----------------------------------------------------------------------
 
-    lines.append("DATA STATUS")
-    lines.append("-" * 60)
+    lines.append(
+        "DATA STATUS"
+    )
+
+    lines.append(
+        "-" * 60
+    )
 
     lines.append(
         f"  HAP: "
@@ -1174,7 +1316,10 @@ def build_report_text(
         f"{'OK' if report.data_status.space_weather_available else 'FAILED'}"
     )
 
-    if report.space_weather.get("retrieved_utc"):
+    if report.space_weather.get(
+        "retrieved_utc"
+    ):
+
         lines.append(
             f"  Space weather retrieved: "
             f"{report.space_weather['retrieved_utc']}"
@@ -1186,8 +1331,13 @@ def build_report_text(
     # INTERPRETATION
     # -----------------------------------------------------------------------
 
-    lines.append("INTERPRETATION")
-    lines.append("-" * 60)
+    lines.append(
+        "INTERPRETATION"
+    )
+
+    lines.append(
+        "-" * 60
+    )
 
     if report.current_band:
 
@@ -1201,7 +1351,8 @@ def build_report_text(
 
             dominant_band = max(
                 report.regional_distribution,
-                key=lambda band: report.regional_distribution[band],
+                key=lambda band:
+                    report.regional_distribution[band],
             )
 
             dominant_count = (
@@ -1234,15 +1385,19 @@ def build_report_text(
         )
 
     lines.append("")
-    lines.append("=" * 60)
 
-    return "\n".join(lines)
+    lines.append(
+        "=" * 60
+    )
+
+    return "\n".join(
+        lines
+    )
 
 
 # ---------------------------------------------------------------------------
 # MAIN REPORT GENERATOR
 # ---------------------------------------------------------------------------
-
 
 def get_propagation_report() -> PropagationReport:
     """
@@ -1269,10 +1424,14 @@ def get_propagation_report() -> PropagationReport:
 
     current_hour = current_time.hour
 
-    generated_utc = current_time.isoformat()
+    generated_utc = (
+        current_time.isoformat()
+    )
 
-    generated_local = format_local_time(
-        current_time
+    generated_local = (
+        format_local_time(
+            current_time
+        )
     )
 
     # -----------------------------------------------------------------------
@@ -1291,8 +1450,10 @@ def get_propagation_report() -> PropagationReport:
 
         status.space_weather_available = True
 
-        space_weather = build_space_weather_report(
-            weather
+        space_weather = (
+            build_space_weather_report(
+                weather
+            )
         )
 
     except Exception as exc:
@@ -1342,27 +1503,35 @@ def get_propagation_report() -> PropagationReport:
     # -----------------------------------------------------------------------
 
     current_band = None
+
     current_frequency_mhz = None
+
     current_support = None
 
     next_transition_utc = None
+
     next_transition_band = None
+
     next_transition_frequency_mhz = None
 
     regional_distribution = {}
 
     try:
 
-        config, decoded_hap = collect_hap(
-            current_time
+        config, decoded_hap = (
+            collect_hap(
+                current_time
+            )
         )
 
         status.hap_available = True
 
-        decoder = HAPDecoder(config)
+        decoder = HAPDecoder(
+            config
+        )
 
         # Current UTC hour.
-        current_hour_result = get_hap_hour(
+        get_hap_hour(
             decoder,
             decoded_hap,
             current_hour,
@@ -1378,10 +1547,12 @@ def get_propagation_report() -> PropagationReport:
             current_hour,
         )
 
-        regional_distribution = extract_regional_distribution(
-            decoder,
-            decoded_hap,
-            current_hour,
+        regional_distribution = (
+            extract_regional_distribution(
+                decoder,
+                decoded_hap,
+                current_hour,
+            )
         )
 
         # Look for the next change in the base-point recommendation.
@@ -1434,7 +1605,9 @@ def get_propagation_report() -> PropagationReport:
             next_transition_frequency_mhz
         ),
 
-        regional_distribution=regional_distribution,
+        regional_distribution=(
+            regional_distribution
+        ),
 
         ionosphere_observations=(
             ionosphere_observations
@@ -1447,9 +1620,10 @@ def get_propagation_report() -> PropagationReport:
         text="",
     )
 
-    # Generate the human-readable representation after the complete report
-    # exists. This means Discord can use either report.text or the individual
-    # structured fields.
+    # Generate the human-readable representation after the complete
+    # report exists. This means Discord can use either report.text or
+    # the individual structured fields.
+
     report.text = build_report_text(
         report
     )
@@ -1460,7 +1634,6 @@ def get_propagation_report() -> PropagationReport:
 # ---------------------------------------------------------------------------
 # TERMINAL DISPLAY
 # ---------------------------------------------------------------------------
-
 
 def main() -> None:
     """
