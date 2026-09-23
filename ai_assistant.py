@@ -2,87 +2,263 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from dataclasses import asdict, is_dataclass
+from datetime import date, datetime
 from typing import Any
 
-from urllib import request
-from urllib.error import URLError, HTTPError
+from dotenv import load_dotenv
+from groq import Groq
+
+from main import get_propagation_report
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-LM_STUDIO_URL = os.getenv(
-    "LM_STUDIO_URL",
-    "http://localhost:1234/v1/chat/completions",
+load_dotenv()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+# Small model is sufficient for routing/tool use.
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL",
+    "openai/gpt-oss-20b",
 )
 
-LM_STUDIO_MODEL = os.getenv(
-    "LM_STUDIO_MODEL",
-    "",
-)
+# Prevent the AI from getting stuck in a tool-call loop.
+MAX_TOOL_ROUNDS = 5
 
-LM_STUDIO_TIMEOUT = int(
-    os.getenv(
-        "LM_STUDIO_TIMEOUT",
-        "120",
+# Internal propagation report cache.
+#
+# Discord already has a cache, but this second layer means
+# multiple AI tool calls in the same request do not repeatedly
+# collect HAP/ionosphere/space-weather data.
+REPORT_CACHE_SECONDS = 300
+
+
+# ============================================================
+# GROQ CLIENT
+# ============================================================
+
+if not GROQ_API_KEY:
+    raise RuntimeError(
+        "GROQ_API_KEY is not set. "
+        "Add it to your .env file."
     )
+
+client = Groq(
+    api_key=GROQ_API_KEY,
 )
 
 
 # ============================================================
-# SYSTEM PROMPT
+# REPORT CACHE
 # ============================================================
 
-SYSTEM_PROMPT = """
-You are RadioPathwayTool, a local amateur-radio propagation
-assistant.
+_cached_report: Any | None = None
+_cached_report_time: float = 0.0
 
-Your job is to answer questions about HF radio propagation
-using the tools provided to you.
 
-IMPORTANT RULES:
+def get_cached_propagation_report() -> Any:
+    """
+    Get the latest propagation report.
 
-1. Use the available tools when the question depends on
-   current propagation conditions.
+    A short cache prevents multiple AI tools from triggering
+    multiple expensive HAP/ionosphere/space-weather collections.
+    """
 
-2. Do not invent current propagation data.
+    global _cached_report
+    global _cached_report_time
 
-3. HAP is the primary propagation prediction source.
+    now = time.monotonic()
 
-4. Ionosphere observations and space weather are supporting
-   information.
+    if (
+        _cached_report is not None
+        and now - _cached_report_time < REPORT_CACHE_SECONDS
+    ):
+        return _cached_report
 
-5. Clearly distinguish between:
-   - measured/observed data
-   - HAP predictions
-   - your interpretation
+    report = get_propagation_report()
 
-6. If the available data does not answer the question,
-   say so.
+    _cached_report = report
+    _cached_report_time = now
 
-7. Do not pretend that HAP guarantees a contact.
-
-8. Keep answers reasonably concise unless the user asks
-   for detail.
-
-9. The station is in Nelson, New Zealand.
-
-10. The operator uses an Xiegu G90 at approximately 20 W.
-
-11. The operator is primarily interested in HF propagation,
-    especially 80 m currently and 20 m in the future.
-
-12. You are an assistant for radio propagation analysis.
-    Do not claim to have personally heard or worked stations.
-
-When discussing a band, explain what the supplied propagation
-data actually indicates rather than inventing an opening.
-"""
+    return report
 
 
 # ============================================================
-# TOOL DEFINITIONS
+# SERIALISATION
+# ============================================================
+
+def serialize_value(value: Any) -> Any:
+    """
+    Convert dataclasses, dictionaries, lists and datetime
+    objects into JSON-safe values.
+
+    This keeps ai_assistant.py independent of the exact internal
+    dataclass/dictionary structure used by main.py.
+    """
+
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return value.isoformat()
+
+    if isinstance(value, date):
+        return value.isoformat()
+
+    if is_dataclass(value):
+        return serialize_value(asdict(value))
+
+    if isinstance(value, dict):
+        return {
+            str(key): serialize_value(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple, set)):
+        return [
+            serialize_value(item)
+            for item in value
+        ]
+
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
+    # Fallback for unexpected objects.
+    return str(value)
+
+
+def json_dumps(value: Any) -> str:
+    """
+    Convert a Python value to compact JSON for the model.
+    """
+
+    return json.dumps(
+        serialize_value(value),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+# ============================================================
+# REPORT HELPERS
+# ============================================================
+
+def get_report_value(
+    report: Any,
+    key: str,
+    default: Any = None,
+) -> Any:
+    """
+    Read a field from either a dictionary or an object.
+
+    This makes the AI layer tolerant of the exact PropagationReport
+    implementation.
+    """
+
+    if isinstance(report, dict):
+        return report.get(key, default)
+
+    return getattr(
+        report,
+        key,
+        default,
+    )
+
+
+# ============================================================
+# TOOL IMPLEMENTATIONS
+# ============================================================
+
+def tool_get_propagation_report() -> str:
+    """
+    Return the complete current propagation report.
+    """
+
+    report = get_cached_propagation_report()
+
+    return json_dumps(report)
+
+
+def tool_get_hap_forecast() -> str:
+    """
+    Return HAP-specific propagation information.
+    """
+
+    report = get_cached_propagation_report()
+
+    hap = get_report_value(
+        report,
+        "hap",
+        None,
+    )
+
+    if hap is None:
+        # Some implementations may store HAP information under
+        # another structure. Returning the full report is safer
+        # than inventing a result.
+        return json_dumps({
+            "error": "HAP data was not found in the report.",
+        })
+
+    return json_dumps(hap)
+
+
+def tool_get_ionosphere() -> str:
+    """
+    Return current ionospheric observations.
+    """
+
+    report = get_cached_propagation_report()
+
+    ionosphere = get_report_value(
+        report,
+        "ionosphere",
+        None,
+    )
+
+    if ionosphere is None:
+        return json_dumps({
+            "error": (
+                "Ionosphere data was not found "
+                "in the report."
+            ),
+        })
+
+    return json_dumps(ionosphere)
+
+
+def tool_get_space_weather() -> str:
+    """
+    Return current solar and geomagnetic conditions.
+    """
+
+    report = get_cached_propagation_report()
+
+    space_weather = get_report_value(
+        report,
+        "space_weather",
+        None,
+    )
+
+    if space_weather is None:
+        return json_dumps({
+            "error": (
+                "Space-weather data was not found "
+                "in the report."
+            ),
+        })
+
+    return json_dumps(space_weather)
+
+
+# ============================================================
+# TOOL SCHEMAS
 # ============================================================
 
 TOOLS = [
@@ -92,9 +268,61 @@ TOOLS = [
             "name": "get_propagation_report",
             "description": (
                 "Get the complete current RadioPathwayTool "
-                "propagation report. This includes HAP propagation "
-                "predictions, regional HAP distribution, ionosphere "
-                "observations, and space weather."
+                "propagation report for Nelson, New Zealand. "
+                "Use this when the user asks a broad question "
+                "about current propagation, band conditions, "
+                "or wants multiple aspects considered."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_hap_forecast",
+            "description": (
+                "Get the current HF Availability Prediction "
+                "(HAP) data. Use this when the user asks about "
+                "which HF bands are currently predicted to work, "
+                "band transitions, or regional HAP distribution."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_ionosphere",
+            "description": (
+                "Get current Australian Space Weather Services "
+                "ionospheric station observations. Use this when "
+                "the user asks about ionospheric conditions, "
+                "enhancement/depression at stations, or whether "
+                "the ionosphere is behaving normally."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_space_weather",
+            "description": (
+                "Get current solar and geomagnetic conditions "
+                "including F10.7, sunspots, K indices, Dst, "
+                "and active space-weather alerts or warnings."
             ),
             "parameters": {
                 "type": "object",
@@ -107,366 +335,347 @@ TOOLS = [
 
 
 # ============================================================
-# HTTP HELPER
+# TOOL MAP
 # ============================================================
 
-def lmstudio_request(
-    payload: dict[str, Any],
-) -> dict[str, Any]:
-
-    body = json.dumps(
-        payload
-    ).encode("utf-8")
-
-    req = request.Request(
-        LM_STUDIO_URL,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-
-    try:
-
-        with request.urlopen(
-            req,
-            timeout=LM_STUDIO_TIMEOUT,
-        ) as response:
-
-            raw = response.read()
-
-    except HTTPError as exc:
-
-        error_body = exc.read().decode(
-            "utf-8",
-            errors="replace",
-        )
-
-        raise RuntimeError(
-            f"LM Studio HTTP {exc.code}: "
-            f"{error_body}"
-        ) from exc
-
-    except URLError as exc:
-
-        raise RuntimeError(
-            "Could not connect to LM Studio. "
-            "Make sure the LM Studio server is running."
-        ) from exc
-
-    return json.loads(
-        raw.decode("utf-8")
-    )
+AVAILABLE_TOOLS = {
+    "get_propagation_report": tool_get_propagation_report,
+    "get_hap_forecast": tool_get_hap_forecast,
+    "get_ionosphere": tool_get_ionosphere,
+    "get_space_weather": tool_get_space_weather,
+}
 
 
 # ============================================================
-# REPORT SERIALISATION
+# SYSTEM PROMPT
 # ============================================================
 
-def _make_json_safe(value):
+SYSTEM_PROMPT = """
+You are the natural-language assistant for RadioPathwayTool,
+an amateur-radio HF propagation assistant.
+
+Your job is to help the user understand HF propagation using
+the data provided by RadioPathwayTool.
+
+IMPORTANT RULES:
+
+1. Use the available tools whenever the question depends on
+   current propagation, HAP, ionosphere, solar activity,
+   geomagnetic conditions, or alerts.
+
+2. NEVER invent current propagation data.
+
+3. Clearly distinguish between:
+   - HAP predictions
+   - measured ionospheric observations
+   - solar/geomagnetic measurements
+   - your interpretation of those measurements
+
+4. HAP is the primary propagation prediction in this system.
+   Space weather and ionosphere observations provide supporting
+   context.
+
+5. Do not treat HAP percentages as guaranteed probability of
+   making a contact. They represent the decoded HAP map
+   distribution used by RadioPathwayTool.
+
+6. When discussing amateur-radio propagation, explain things
+   in practical terms where useful.
+
+7. The user's main station location is Nelson, New Zealand.
+
+8. The user is interested in HF amateur radio, particularly
+   80m, 40m, 20m and other HF bands.
+
+9. The user uses a Xiegu G90 at approximately 20 W.
+
+10. Do not claim that a band is guaranteed to work.
+    Propagation forecasts are predictions and actual contacts
+    depend on many factors.
+
+11. If the available data does not answer the question,
+    say so rather than making up information.
+
+12. You can answer normal conversational questions without
+    using a tool when current data is not required.
+
+13. Keep answers concise for Discord. Usually use a few
+    paragraphs or short bullet points rather than a huge report.
+
+14. If a user asks "why", explain the physical reasoning using
+    the available data rather than simply repeating the data.
+
+15. If the user asks about a future time and the available
+    tool data does not actually contain a forecast for that
+    specific time, say that clearly.
+
+16. Never execute arbitrary Python, shell commands, or code.
+    You may only use the explicitly provided tools.
+
+17. Do not claim to have information from the internet unless
+    that information was actually supplied by a tool.
+
+18. If a tool returns an error or missing data, report that
+    limitation honestly.
+
+You are an assistant layered on top of a real propagation
+engine. The propagation engine is the authority for current
+data; you are responsible for interpreting it clearly.
+"""
+
+
+# ============================================================
+# TOOL CALL SERIALISATION
+# ============================================================
+
+def assistant_message_to_dict(message: Any) -> dict[str, Any]:
     """
-    Convert RadioPathwayTool objects into JSON-safe data.
-
-    This intentionally handles dataclasses, dictionaries,
-    lists, tuples and ordinary objects.
+    Convert the Groq SDK assistant message into the dictionary
+    format required for the next Chat Completion request.
     """
 
-    if value is None:
-        return None
+    result: dict[str, Any] = {
+        "role": "assistant",
+        "content": message.content,
+    }
 
-    if isinstance(
-        value,
-        (
-            str,
-            int,
-            float,
-            bool,
-        ),
-    ):
-        return value
+    if message.tool_calls:
+        result["tool_calls"] = []
 
-    if isinstance(value, dict):
-
-        return {
-            str(key): _make_json_safe(item)
-            for key, item in value.items()
-        }
-
-    if isinstance(
-        value,
-        (
-            list,
-            tuple,
-        ),
-    ):
-
-        return [
-            _make_json_safe(item)
-            for item in value
-        ]
-
-    if hasattr(
-        value,
-        "__dataclass_fields__",
-    ):
-
-        return {
-            key: _make_json_safe(
-                getattr(value, key)
+        for tool_call in message.tool_calls:
+            result["tool_calls"].append(
+                {
+                    "id": tool_call.id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_call.function.name,
+                        "arguments": tool_call.function.arguments,
+                    },
+                }
             )
-            for key in value.__dataclass_fields__
-        }
 
-    if hasattr(
-        value,
-        "__dict__",
-    ):
-
-        return {
-            key: _make_json_safe(item)
-            for key, item in vars(value).items()
-            if not key.startswith("_")
-        }
-
-    return str(value)
-
-
-def serialise_report(report) -> str:
-    """
-    Convert a PropagationReport into JSON for the AI.
-    """
-
-    data = _make_json_safe(
-        report
-    )
-
-    return json.dumps(
-        data,
-        indent=2,
-        ensure_ascii=False,
-        default=str,
-    )
+    return result
 
 
 # ============================================================
 # TOOL EXECUTION
 # ============================================================
 
-def execute_tool(
-    name: str,
-    arguments: dict[str, Any],
-    report,
-):
+def execute_tool_call(
+    tool_call: Any,
+) -> str:
     """
-    Execute an AI-requested tool.
+    Safely execute one model-requested tool.
 
-    The AI never gets direct access to Python.
-    Only explicitly registered tools can be executed.
+    The model can only execute functions present in
+    AVAILABLE_TOOLS.
     """
 
-    if name == "get_propagation_report":
+    tool_name = tool_call.function.name
 
-        return serialise_report(
-            report
+    tool_function = AVAILABLE_TOOLS.get(
+        tool_name
+    )
+
+    if tool_function is None:
+        return json_dumps({
+            "error": (
+                f"Unknown tool requested: {tool_name}"
+            ),
+        })
+
+    try:
+        # All current tools have no arguments.
+        #
+        # We still parse the JSON so malformed arguments can
+        # be detected rather than silently ignored.
+        raw_arguments = (
+            tool_call.function.arguments or "{}"
         )
 
-    raise ValueError(
-        f"Unknown AI tool: {name}"
-    )
+        try:
+            arguments = json.loads(
+                raw_arguments
+            )
+        except json.JSONDecodeError:
+            return json_dumps({
+                "error": (
+                    f"Invalid arguments supplied for "
+                    f"{tool_name}."
+                ),
+            })
+
+        if not isinstance(arguments, dict):
+            return json_dumps({
+                "error": (
+                    f"Invalid argument structure for "
+                    f"{tool_name}."
+                ),
+            })
+
+        # These tools currently take no arguments.
+        return tool_function()
+
+    except Exception as exc:
+        return json_dumps({
+            "error": (
+                f"Tool {tool_name} failed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        })
 
 
 # ============================================================
-# AI ASSISTANT
+# MAIN AI FUNCTION
 # ============================================================
 
 def ask_radio_assistant(
-    question: str,
-    report,
-    conversation_history: list[dict[str, str]] | None = None,
-) -> str:
+    user_message: str,
+    conversation_history: list[dict[str, Any]] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
     """
-    Ask the local LM Studio model a radio question.
-
-    The model can request one of the explicitly registered
+    Send a user question to Groq and allow the model to call
     RadioPathwayTool functions.
-    """
 
-    if not LM_STUDIO_MODEL:
+    Returns:
 
-        raise RuntimeError(
-            "LM_STUDIO_MODEL is not configured. "
-            "Set it in your .env file."
+        (
+            final_answer,
+            updated_conversation_history
         )
 
-    messages = [
+    The returned history contains the messages necessary to
+    continue the conversation.
+    """
+
+    if not user_message.strip():
+        return (
+            "Please ask me a question.",
+            conversation_history or [],
+        )
+
+    history = list(
+        conversation_history or []
+    )
+
+    # Prevent the stored history from becoming enormous.
+    #
+    # We keep the most recent messages. The system prompt is
+    # always added separately and is therefore never lost.
+    history = history[-10:]
+
+    messages: list[dict[str, Any]] = [
         {
             "role": "system",
             "content": SYSTEM_PROMPT,
         }
     ]
 
-    # --------------------------------------------------------
-    # Optional short conversation history
-    # --------------------------------------------------------
-
-    if conversation_history:
-
-        messages.extend(
-            conversation_history[-10:]
-        )
+    messages.extend(history)
 
     messages.append(
         {
             "role": "user",
-            "content": question,
+            "content": user_message,
         }
     )
 
-    # --------------------------------------------------------
-    # First AI request
-    # --------------------------------------------------------
+    # ========================================================
+    # TOOL-CALLING LOOP
+    # ========================================================
 
-    response = lmstudio_request(
-        {
-            "model": LM_STUDIO_MODEL,
-            "messages": messages,
-            "tools": TOOLS,
-            "tool_choice": "auto",
-            "temperature": 0.2,
-        }
-    )
+    for _ in range(MAX_TOOL_ROUNDS):
 
-    choices = response.get(
-        "choices",
-        [],
-    )
-
-    if not choices:
-
-        raise RuntimeError(
-            "LM Studio returned no choices."
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            temperature=0.2,
+            max_completion_tokens=1200,
         )
 
-    message = choices[0].get(
-        "message",
-        {},
-    )
+        message = response.choices[0].message
 
-    tool_calls = message.get(
-        "tool_calls",
-        [],
-    )
+        # ----------------------------------------------------
+        # No tool call = final answer
+        # ----------------------------------------------------
 
-    # --------------------------------------------------------
-    # No tool required
-    # --------------------------------------------------------
+        if not message.tool_calls:
 
-    if not tool_calls:
-
-        content = message.get(
-            "content",
-            "",
-        )
-
-        if content:
-
-            return content.strip()
-
-        return (
-            "I couldn't generate a response."
-        )
-
-    # --------------------------------------------------------
-    # Execute requested tools
-    # --------------------------------------------------------
-
-    messages.append(
-        message
-    )
-
-    for tool_call in tool_calls:
-
-        function = tool_call.get(
-            "function",
-            {},
-        )
-
-        name = function.get(
-            "name"
-        )
-
-        raw_arguments = function.get(
-            "arguments",
-            "{}",
-        )
-
-        try:
-
-            arguments = json.loads(
-                raw_arguments
+            final_answer = (
+                message.content
+                or "I couldn't generate an answer."
             )
 
-        except json.JSONDecodeError:
+            # Store the assistant response in history.
+            updated_history = history + [
+                {
+                    "role": "user",
+                    "content": user_message,
+                },
+                {
+                    "role": "assistant",
+                    "content": final_answer,
+                },
+            ]
 
-            arguments = {}
+            # Keep history bounded.
+            updated_history = updated_history[-10:]
 
-        result = execute_tool(
-            name,
-            arguments,
-            report,
+            return (
+                final_answer.strip(),
+                updated_history,
+            )
+
+        # ----------------------------------------------------
+        # Tool calls requested
+        # ----------------------------------------------------
+
+        assistant_dict = assistant_message_to_dict(
+            message
         )
 
         messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": tool_call.get(
-                    "id",
-                    "",
-                ),
-                "name": name,
-                "content": result,
-            }
+            assistant_dict
         )
 
-    # --------------------------------------------------------
-    # Second AI request
-    # --------------------------------------------------------
+        for tool_call in message.tool_calls:
 
-    final_response = lmstudio_request(
+            result = execute_tool_call(
+                tool_call
+            )
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": tool_call.function.name,
+                    "content": result,
+                }
+            )
+
+    # ========================================================
+    # SAFETY LIMIT
+    # ========================================================
+
+    fallback = (
+        "I reached the tool-call limit while trying to "
+        "answer that question. Please try asking it again."
+    )
+
+    updated_history = history + [
         {
-            "model": LM_STUDIO_MODEL,
-            "messages": messages,
-            "temperature": 0.2,
-        }
+            "role": "user",
+            "content": user_message,
+        },
+        {
+            "role": "assistant",
+            "content": fallback,
+        },
+    ]
+
+    return (
+        fallback,
+        updated_history[-10:],
     )
-
-    final_choices = final_response.get(
-        "choices",
-        [],
-    )
-
-    if not final_choices:
-
-        raise RuntimeError(
-            "LM Studio returned no final answer."
-        )
-
-    final_message = final_choices[0].get(
-        "message",
-        {},
-    )
-
-    content = final_message.get(
-        "content",
-        "",
-    )
-
-    if not content:
-
-        return (
-            "I collected the propagation data, "
-            "but couldn't generate an answer."
-        )
-
-    return content.strip()
