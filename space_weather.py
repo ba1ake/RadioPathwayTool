@@ -1,9 +1,8 @@
-
 """
 Space Weather Data Collector
 ============================
 
-V0.1
+V0.2
 
 Purpose:
     Collect the space-weather information needed by the HF propagation
@@ -34,7 +33,7 @@ Data sources:
     NOAA's public JSON products do not currently require an API key.
 
 This module deliberately separates DATA COLLECTION from the propagation
-scoring engine.
+analysis engine.
 
 The output can later be passed into band_favorability.py.
 """
@@ -43,8 +42,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 import requests
@@ -63,6 +63,13 @@ SWS_API_BASE = (
 NOAA_BASE = (
     "https://services.swpc.noaa.gov"
 )
+
+# Alerts which do not contain an explicit expiry time are retained for this
+# long after their issue time.
+#
+# This prevents old historical alerts from appearing indefinitely while still
+# allowing recent watches/alerts to remain visible.
+ALERT_FALLBACK_MAX_AGE_HOURS = 48
 
 
 # ============================================================================
@@ -302,6 +309,398 @@ def latest_record(
 
 
 # ============================================================================
+# ALERT DATE/TIME HELPERS
+# ============================================================================
+
+def parse_datetime(
+    value: Any,
+) -> Optional[datetime]:
+    """
+    Try to convert a variety of timestamp formats into a timezone-aware
+    UTC datetime.
+
+    Handles:
+        ISO 8601
+        timestamps ending in Z
+        timestamps with offsets
+        common NOAA/SWS textual timestamps
+    """
+
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+
+        if value.tzinfo is None:
+            return value.replace(
+                tzinfo=timezone.utc
+            )
+
+        return value.astimezone(
+            timezone.utc
+        )
+
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+
+    if not text:
+        return None
+
+    # Normalise common UTC notation.
+    text = text.replace(
+        " UTC",
+        "+00:00",
+    )
+
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+
+    # First try Python's ISO parser.
+    try:
+
+        parsed = datetime.fromisoformat(
+            text
+        )
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(
+                tzinfo=timezone.utc
+            )
+
+        return parsed.astimezone(
+            timezone.utc
+        )
+
+    except ValueError:
+        pass
+
+    # Common NOAA/SWS formats.
+    formats = (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%Y %b %d %H:%M",
+        "%Y %b %d %H:%M:%S",
+        "%Y %B %d %H:%M",
+        "%Y %B %d %H:%M:%S",
+        "%d %b %Y %H:%M",
+        "%d %b %Y %H:%M:%S",
+    )
+
+    for fmt in formats:
+
+        try:
+
+            parsed = datetime.strptime(
+                text,
+                fmt,
+            )
+
+            return parsed.replace(
+                tzinfo=timezone.utc
+            )
+
+        except ValueError:
+            continue
+
+    return None
+
+
+def extract_alert_issue_time(
+    alert: dict[str, Any],
+) -> Optional[datetime]:
+    """
+    Find the issue/publication time in an alert.
+
+    Different NOAA/SWS products use different field names.
+    """
+
+    possible_fields = (
+        "issue_datetime",
+        "issue_time",
+        "issued",
+        "issued_datetime",
+        "issueDateTime",
+        "issueDate",
+        "publication_time",
+        "published",
+        "created",
+        "created_at",
+        "timestamp",
+        "datetime",
+        "date_time",
+    )
+
+    for field in possible_fields:
+
+        if field not in alert:
+            continue
+
+        parsed = parse_datetime(
+            alert.get(field)
+        )
+
+        if parsed is not None:
+            return parsed
+
+    return None
+
+
+def extract_alert_expiry_time(
+    alert: dict[str, Any],
+) -> Optional[datetime]:
+    """
+    Find an explicit expiry/valid-until time.
+
+    Checks structured fields first, then searches the alert message for
+    phrases such as:
+
+        Valid Until: 2026 Sep 16 1800 UTC
+        Valid until 2026 Sep 16 1800 UTC
+        Valid To: ...
+        Expires: ...
+    """
+
+    # ------------------------------------------------------------------------
+    # Structured API fields
+    # ------------------------------------------------------------------------
+
+    possible_fields = (
+        "valid_until",
+        "valid_until_datetime",
+        "valid_to",
+        "valid_to_datetime",
+        "validTo",
+        "validUntil",
+        "expiry",
+        "expiry_time",
+        "expiry_datetime",
+        "expires",
+        "expires_at",
+        "expiration",
+        "expiration_time",
+        "end_time",
+        "end_datetime",
+        "end",
+    )
+
+    for field in possible_fields:
+
+        if field not in alert:
+            continue
+
+        parsed = parse_datetime(
+            alert.get(field)
+        )
+
+        if parsed is not None:
+            return parsed
+
+    # ------------------------------------------------------------------------
+    # Search message/text fields
+    # ------------------------------------------------------------------------
+
+    text_fields = (
+        "message",
+        "text",
+        "description",
+        "body",
+        "content",
+        "summary",
+    )
+
+    combined_text = " ".join(
+        str(alert.get(field, ""))
+        for field in text_fields
+    )
+
+    if not combined_text:
+        return None
+
+    # Examples:
+    #
+    # Valid Until: 2026 Sep 16 1800 UTC
+    # Valid until 2026 Sep 16 1800 UTC
+    #
+    # The regex intentionally allows both abbreviated and full month names.
+
+    patterns = (
+        r"valid\s+until\s*:?\s*"
+        r"(\d{4}\s+[A-Za-z]{3,9}\s+\d{1,2}\s+\d{3,4}\s*UTC)",
+
+        r"valid\s+to\s*:?\s*"
+        r"(\d{4}\s+[A-Za-z]{3,9}\s+\d{1,2}\s+\d{3,4}\s*UTC)",
+
+        r"expires?\s*:?\s*"
+        r"(\d{4}\s+[A-Za-z]{3,9}\s+\d{1,2}\s+\d{3,4}\s*UTC)",
+    )
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            combined_text,
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            continue
+
+        date_text = match.group(1)
+
+        # Convert 1800 -> 18:00 and 900 -> 09:00.
+        date_match = re.match(
+            r"(\d{4})\s+([A-Za-z]{3,9})\s+"
+            r"(\d{1,2})\s+(\d{3,4})\s*UTC",
+            date_text,
+            flags=re.IGNORECASE,
+        )
+
+        if not date_match:
+            continue
+
+        year = date_match.group(1)
+        month = date_match.group(2)
+        day = date_match.group(3)
+        time_part = date_match.group(4)
+
+        if len(time_part) == 3:
+            time_part = "0" + time_part
+
+        normalised = (
+            f"{year} {month} {day} "
+            f"{time_part[:2]}:{time_part[2:]} UTC"
+        )
+
+        parsed = parse_datetime(
+            normalised
+        )
+
+        if parsed is not None:
+            return parsed
+
+    return None
+
+
+def is_alert_current(
+    alert: dict[str, Any],
+    now_utc: Optional[datetime] = None,
+    max_age_hours: int = ALERT_FALLBACK_MAX_AGE_HOURS,
+) -> bool:
+    """
+    Determine whether an alert should be exposed as current.
+
+    Rules:
+
+    1. If an explicit expiry time exists:
+         keep only if it has not expired.
+
+    2. If there is no expiry time but an issue time exists:
+         keep it for max_age_hours.
+
+    3. If neither expiry nor issue time can be determined:
+         keep it rather than silently discarding potentially important
+         information.
+
+    The final case is deliberately conservative because different SWS/NOAA
+    products can have unusual structures.
+    """
+
+    if now_utc is None:
+
+        now_utc = datetime.now(
+            timezone.utc
+        )
+
+    if now_utc.tzinfo is None:
+
+        now_utc = now_utc.replace(
+            tzinfo=timezone.utc
+        )
+
+    else:
+
+        now_utc = now_utc.astimezone(
+            timezone.utc
+        )
+
+    # ------------------------------------------------------------------------
+    # Explicit expiry
+    # ------------------------------------------------------------------------
+
+    expiry = extract_alert_expiry_time(
+        alert
+    )
+
+    if expiry is not None:
+
+        return expiry >= now_utc
+
+    # ------------------------------------------------------------------------
+    # No explicit expiry: use issue age
+    # ------------------------------------------------------------------------
+
+    issue_time = extract_alert_issue_time(
+        alert
+    )
+
+    if issue_time is not None:
+
+        age = now_utc - issue_time
+
+        # Future-dated records are retained.
+        if age.total_seconds() < 0:
+            return True
+
+        return age <= timedelta(
+            hours=max_age_hours
+        )
+
+    # ------------------------------------------------------------------------
+    # Unknown format
+    # ------------------------------------------------------------------------
+
+    return True
+
+
+def filter_current_alerts(
+    alerts: Any,
+    now_utc: Optional[datetime] = None,
+    max_age_hours: int = ALERT_FALLBACK_MAX_AGE_HOURS,
+) -> list[dict[str, Any]]:
+    """
+    Filter a collection of NOAA/SWS alerts down to currently relevant
+    records.
+
+    The original records are returned unchanged; this function only decides
+    which records should be exposed to the rest of the application.
+    """
+
+    if not isinstance(alerts, list):
+        return []
+
+    filtered = []
+
+    for alert in alerts:
+
+        if not isinstance(alert, dict):
+            continue
+
+        if is_alert_current(
+            alert,
+            now_utc=now_utc,
+            max_age_hours=max_age_hours,
+        ):
+
+            filtered.append(alert)
+
+    return filtered
+
+
+# ============================================================================
 # NOAA: SOLAR RADIO FLUX
 # ============================================================================
 
@@ -324,7 +723,6 @@ def get_noaa_solar_flux() -> Optional[float]:
         if not record:
             return None
 
-        # NOAA products may use different field names depending on product.
         for key in (
             "flux",
             "f10.7",
@@ -527,7 +925,11 @@ def get_noaa_sunspot_number() -> Optional[float]:
 
 def get_noaa_alerts() -> list[dict[str, Any]]:
     """
-    Retrieve active NOAA space-weather alerts.
+    Retrieve NOAA space-weather alerts and filter them to currently relevant
+    records.
+
+    The unfiltered response is handled separately by collect_space_weather()
+    and retained under raw["NOAA alerts"].
     """
 
     try:
@@ -538,11 +940,9 @@ def get_noaa_alerts() -> list[dict[str, Any]]:
 
         if isinstance(data, list):
 
-            return [
-                item
-                for item in data
-                if isinstance(item, dict)
-            ]
+            return filter_current_alerts(
+                data
+            )
 
         return []
 
@@ -714,6 +1114,9 @@ def get_sws_dst() -> Optional[float]:
 def get_sws_magnetic_alert() -> list[dict[str, Any]]:
     """
     Retrieve current Australian-region magnetic alerts.
+
+    Filtering is applied before the data is returned to the propagation
+    engine.
     """
 
     try:
@@ -728,7 +1131,10 @@ def get_sws_magnetic_alert() -> list[dict[str, Any]]:
         )
 
         if isinstance(data, list):
-            return data
+
+            return filter_current_alerts(
+                data
+            )
 
         return []
 
@@ -744,6 +1150,9 @@ def get_sws_magnetic_alert() -> list[dict[str, Any]]:
 def get_sws_magnetic_warning() -> list[dict[str, Any]]:
     """
     Retrieve current Australian-region magnetic warnings.
+
+    Filtering is applied before the data is returned to the propagation
+    engine.
     """
 
     try:
@@ -758,7 +1167,10 @@ def get_sws_magnetic_warning() -> list[dict[str, Any]]:
         )
 
         if isinstance(data, list):
-            return data
+
+            return filter_current_alerts(
+                data
+            )
 
         return []
 
@@ -788,7 +1200,10 @@ def get_sws_aurora_watch() -> list[dict[str, Any]]:
         )
 
         if isinstance(data, list):
-            return data
+
+            return filter_current_alerts(
+                data
+            )
 
         return []
 
@@ -818,7 +1233,10 @@ def get_sws_aurora_outlook() -> list[dict[str, Any]]:
         )
 
         if isinstance(data, list):
-            return data
+
+            return filter_current_alerts(
+                data
+            )
 
         return []
 
@@ -838,11 +1256,16 @@ def collect_space_weather() -> SpaceWeatherData:
     The collector is deliberately fault tolerant.
 
     If one service fails, the remaining services are still used.
+
+    Alerts are filtered inside this module so downstream code receives
+    currently relevant information rather than historical API records.
     """
 
-    retrieved = datetime.now(
+    retrieved_dt = datetime.now(
         timezone.utc
-    ).isoformat()
+    )
+
+    retrieved = retrieved_dt.isoformat()
 
     status = {}
     raw = {}
@@ -905,11 +1328,41 @@ def collect_space_weather() -> SpaceWeatherData:
     # NOAA alerts
     # ------------------------------------------------------------------------
 
-    noaa_alerts = get_noaa_alerts()
+    # Retrieve the complete API response first.
+    #
+    # This is important because raw data should remain available for
+    # debugging, historical analysis and future improvements to the filter.
+
+    try:
+
+        noaa_alert_response = get_json(
+            NOAA_ENDPOINTS["alerts"]
+        )
+
+        if isinstance(noaa_alert_response, list):
+
+            noaa_alerts_raw = [
+                item
+                for item in noaa_alert_response
+                if isinstance(item, dict)
+            ]
+
+        else:
+
+            noaa_alerts_raw = []
+
+    except Exception:
+
+        noaa_alerts_raw = []
+
+    noaa_alerts = filter_current_alerts(
+        noaa_alerts_raw,
+        now_utc=retrieved_dt,
+    )
 
     status["NOAA alerts"] = "OK"
 
-    raw["NOAA alerts"] = noaa_alerts
+    raw["NOAA alerts"] = noaa_alerts_raw
 
     # ------------------------------------------------------------------------
     # SWS
@@ -989,6 +1442,11 @@ def collect_space_weather() -> SpaceWeatherData:
         a_index = None
         sws_dst = None
 
+        magnetic_alerts = []
+        magnetic_warnings = []
+        aurora_watch = []
+        aurora_outlook = []
+
         sws_available = False
 
         sws_error = (
@@ -1023,10 +1481,7 @@ def collect_space_weather() -> SpaceWeatherData:
         active_alerts=noaa_alerts,
 
         active_warnings=(
-            raw.get(
-                "SWS magnetic warnings",
-                [],
-            )
+            magnetic_warnings
         ),
 
         sws_available=sws_available,
@@ -1058,8 +1513,11 @@ def to_propagation_inputs(
     avoiding a hard dependency during simple data collection/testing.
     """
 
-    from band_favorability import (
-        PropagationInputs,
+    import importlib
+
+    propagation_inputs_type = getattr(
+        importlib.import_module("band_favorability"),
+        "PropagationInputs",
     )
 
     if timestamp_utc is None:
@@ -1068,7 +1526,7 @@ def to_propagation_inputs(
             timezone.utc
         )
 
-    return PropagationInputs(
+    return propagation_inputs_type(
 
         latitude=latitude,
         longitude=longitude,
@@ -1169,8 +1627,13 @@ def print_summary(
     print("-" * 65)
 
     print(
-        f"  NOAA alerts:  "
+        f"  Current NOAA alerts: "
         f"{len(weather.active_alerts or [])}"
+    )
+
+    print(
+        f"  Current SWS warnings:"
+        f" {len(weather.active_warnings or [])}"
     )
 
     print(

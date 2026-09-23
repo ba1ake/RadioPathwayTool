@@ -232,23 +232,23 @@ def get_hap_hour(
     hour_utc: int,
 ) -> Any:
     """
-    Obtain the HAP result for a particular UTC hour.
+    Return the decoded HAP data for a particular UTC hour.
 
-    The exact object returned by HAPDecoder is deliberately kept internal
-    to this module.
+    The decoder's recommendation helpers expect the complete decoded
+    dictionary plus the requested UTC hour, so this function simply
+    validates that the hour exists and returns it.
     """
 
-    # HAPDecoder.decode_all() produces the hourly results indexed by UTC
-    # hour in the current implementation.
     return decoded_hap[hour_utc]
 
 
 def extract_hap_base_recommendation(
     decoder: HAPDecoder,
-    hour_result: Any,
+    decoded_hap: Any,
+    hour_utc: int,
 ) -> tuple[Optional[str], Optional[float], Optional[int]]:
     """
-    Extract the HAP recommendation for the base/grid point.
+    Extract the HAP recommendation for the Nelson base point.
 
     Returns:
 
@@ -261,13 +261,18 @@ def extract_hap_base_recommendation(
 
     try:
         recommendation = decoder.get_base_recommendation(
-            hour_result
+            decoded=decoded_hap,
+            hour_utc=hour_utc,
         )
 
         if recommendation is None:
             return None, None, None
 
-        band = getattr(recommendation, "band", None)
+        band = getattr(
+            recommendation,
+            "band",
+            None,
+        )
 
         frequency_khz = getattr(
             recommendation,
@@ -275,10 +280,11 @@ def extract_hap_base_recommendation(
             None,
         )
 
-        if frequency_khz is None:
-            frequency_mhz = None
-        else:
-            frequency_mhz = frequency_khz / 1000.0
+        frequency_mhz = (
+            frequency_khz / 1000.0
+            if frequency_khz is not None
+            else None
+        )
 
         support = getattr(
             recommendation,
@@ -286,7 +292,11 @@ def extract_hap_base_recommendation(
             None,
         )
 
-        return band, frequency_mhz, support
+        return (
+            band,
+            frequency_mhz,
+            support,
+        )
 
     except Exception:
         return None, None, None
@@ -294,7 +304,8 @@ def extract_hap_base_recommendation(
 
 def extract_regional_distribution(
     decoder: HAPDecoder,
-    hour_result: Any,
+    decoded_hap: Any,
+    hour_utc: int,
 ) -> dict[str, int]:
     """
     Extract the number of HAP grid points assigned to each band.
@@ -304,14 +315,13 @@ def extract_regional_distribution(
 
     try:
         distribution = decoder.get_regional_distribution(
-            hour_result
+            decoded=decoded_hap,
+            hour_utc=hour_utc,
         )
 
         if distribution is None:
             return {}
 
-        # Convert to a plain dictionary so the returned report is easy for
-        # Discord, JSON, logging, etc. to consume.
         return {
             str(band): int(count)
             for band, count in distribution.items()
@@ -348,7 +358,8 @@ def find_next_hap_transition(
 
         current_band, _, _ = extract_hap_base_recommendation(
             decoder,
-            current_result,
+            decoded_hap,
+            current_hour,
         )
 
         if current_band is None:
@@ -365,12 +376,12 @@ def find_next_hap_transition(
             )
 
             band, frequency_mhz, _ = (
-                extract_hap_base_recommendation(
-                    decoder,
-                    result,
-                )
-            )
-
+                    extract_hap_base_recommendation(
+                decoder,
+                decoded_hap,
+                hour,
+    )
+)
             if band is None:
                 continue
 
@@ -772,6 +783,184 @@ def format_space_weather(
     return lines
 
 
+def extract_alert_message(
+    alert: dict[str, Any],
+) -> str:
+    """
+    Extract the human-readable message from a space-weather alert.
+    """
+
+    for key in (
+        "message",
+        "text",
+        "description",
+        "body",
+        "content",
+        "summary",
+    ):
+        value = alert.get(key)
+
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    return ""
+
+
+def format_space_weather_alert(
+    alert: dict[str, Any],
+) -> str:
+    """
+    Convert a raw space-weather alert dictionary into a concise
+    human-readable summary.
+
+    The full alert remains available in SpaceWeatherData.raw.
+    """
+
+    message = extract_alert_message(alert)
+
+    if not message:
+        return "Space-weather alert"
+
+    # ------------------------------------------------------------
+    # Geomagnetic storm watch
+    # ------------------------------------------------------------
+
+    storm_match = re.search(
+        r"WATCH:\s*Geomagnetic Storm Category\s+"
+        r"(G\d+)\s+Predicted",
+        message,
+        flags=re.IGNORECASE,
+    )
+
+    if storm_match:
+
+        level = storm_match.group(1).upper()
+
+        # Look for a predicted date/level such as:
+        # Sep 24: G1 (Minor)
+
+        date_match = re.search(
+            r"([A-Z][a-z]{2}\s+\d{1,2})\s*:\s*"
+            rf"{re.escape(level)}\s*\(",
+            message,
+            flags=re.IGNORECASE,
+        )
+
+        if date_match:
+
+            return (
+                f"{level} geomagnetic storm watch "
+                f"for {date_match.group(1)}"
+            )
+
+        return (
+            f"{level} geomagnetic storm watch"
+        )
+
+    # ------------------------------------------------------------
+    # Geomagnetic storm warning
+    # ------------------------------------------------------------
+
+    warning_match = re.search(
+        r"WARNING:\s*Geomagnetic Storm Category\s+"
+        r"(G\d+)",
+        message,
+        flags=re.IGNORECASE,
+    )
+
+    if warning_match:
+
+        level = warning_match.group(1).upper()
+
+        return (
+            f"{level} geomagnetic storm warning"
+        )
+
+    # ------------------------------------------------------------
+    # Generic WATCH
+    # ------------------------------------------------------------
+
+    generic_watch = re.search(
+        r"WATCH:\s*(.+?)(?:\r?\n|$)",
+        message,
+        flags=re.IGNORECASE,
+    )
+
+    if generic_watch:
+
+        text = generic_watch.group(1).strip()
+
+        return text
+
+    # ------------------------------------------------------------
+    # Generic WARNING
+    # ------------------------------------------------------------
+
+    generic_warning = re.search(
+        r"WARNING:\s*(.+?)(?:\r?\n|$)",
+        message,
+        flags=re.IGNORECASE,
+    )
+
+    if generic_warning:
+
+        text = generic_warning.group(1).strip()
+
+        return text
+
+    # ------------------------------------------------------------
+    # Generic ALERT
+    # ------------------------------------------------------------
+
+    generic_alert = re.search(
+        r"ALERT:\s*(.+?)(?:\r?\n|$)",
+        message,
+        flags=re.IGNORECASE,
+    )
+
+    if generic_alert:
+
+        text = generic_alert.group(1).strip()
+
+        return text
+
+    # ------------------------------------------------------------
+    # Fallback
+    # ------------------------------------------------------------
+
+    first_line = message.splitlines()[0].strip()
+
+    if first_line:
+        return first_line
+
+    return "Space-weather alert"
+
+def format_space_weather_alerts(
+    alerts: list[dict[str, Any]] | None,
+) -> list[str]:
+    """
+    Format all currently active space-weather alerts.
+    """
+
+    if not alerts:
+        return []
+
+    formatted = []
+
+    for alert in alerts:
+
+        if not isinstance(alert, dict):
+            continue
+
+        text = format_space_weather_alert(
+            alert
+        )
+
+        if text and text not in formatted:
+            formatted.append(text)
+
+    return formatted
+
 def build_report_text(
     report: PropagationReport,
 ) -> str:
@@ -1012,7 +1201,7 @@ def build_report_text(
 
             dominant_band = max(
                 report.regional_distribution,
-                key=report.regional_distribution.get,
+                key=lambda band: report.regional_distribution[band],
             )
 
             dominant_count = (
@@ -1185,14 +1374,14 @@ def get_propagation_report() -> PropagationReport:
             current_support,
         ) = extract_hap_base_recommendation(
             decoder,
-            current_hour_result,
+            decoded_hap,
+            current_hour,
         )
 
-        regional_distribution = (
-            extract_regional_distribution(
-                decoder,
-                current_hour_result,
-            )
+        regional_distribution = extract_regional_distribution(
+            decoder,
+            decoded_hap,
+            current_hour,
         )
 
         # Look for the next change in the base-point recommendation.
