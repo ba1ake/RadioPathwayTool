@@ -2,7 +2,7 @@
 Space Weather Data Collector
 ============================
 
-V0.2
+V0.3
 
 Purpose:
     Collect the space-weather information needed by the HF propagation
@@ -12,6 +12,7 @@ Primary geographic focus:
     New Zealand / Australia / South Pacific
 
 Data sources:
+
     NOAA SWPC
         - F10.7 solar flux
         - planetary K index
@@ -24,13 +25,18 @@ Data sources:
         - Australian-region Dst
         - magnetic alerts/warnings
         - aurora alerts/watches/outlooks
+        - real-time T indices from the public SWS website
 
-    SWS requires an API key.
-    Set the environment variable:
+SWS API functions require an API key.
 
-        SWS_API_KEY
+Set the environment variable:
 
-    NOAA's public JSON products do not currently require an API key.
+    SWS_API_KEY
+
+The public SWS real-time T-index webpage does NOT require
+the SWS API key.
+
+NOAA's public JSON products do not currently require an API key.
 
 This module deliberately separates DATA COLLECTION from the propagation
 analysis engine.
@@ -40,12 +46,24 @@ The output can later be passed into band_favorability.py.
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
-from dataclasses import dataclass, asdict
-from datetime import datetime, timezone, timedelta
-from typing import Any, Optional
+from dataclasses import (
+    dataclass,
+    asdict,
+    field,
+)
+from datetime import (
+    datetime,
+    timezone,
+    timedelta,
+)
+from typing import (
+    Any,
+    Optional,
+)
 
 import requests
 
@@ -58,6 +76,13 @@ REQUEST_TIMEOUT = 15
 
 SWS_API_BASE = (
     "https://sws-data.sws.bom.gov.au/api/v1"
+)
+
+# Public SWS real-time T-index webpage.
+#
+# This does NOT require an SWS API key.
+SWS_REALTIME_T_INDEX_URL = (
+    "https://www.sws.bom.gov.au/HF_Systems/6/4/2"
 )
 
 NOAA_BASE = (
@@ -129,6 +154,22 @@ class SpaceWeatherData:
     analysis engine.
 
     None means the value was unavailable.
+
+    t_index:
+        Default real-time T-index selected for general use.
+
+    t_index_source:
+        Human-readable description of where the default T-index came from.
+
+    t_indices:
+        Dictionary containing all real-time T-index values successfully
+        retrieved from the SWS public webpage.
+
+    t_index_retrieved_utc:
+        UTC time at which the SWS T-index webpage was retrieved.
+
+    t_index_updated_utc:
+        UTC time reported by SWS for the actual T-index data update.
     """
 
     # ------------------------------------------------------------------------
@@ -150,7 +191,6 @@ class SpaceWeatherData:
 
     planetary_k_index: Optional[float] = None
     australian_k_index: Optional[float] = None
-
     a_index: Optional[float] = None
     dst_index: Optional[float] = None
 
@@ -159,9 +199,29 @@ class SpaceWeatherData:
     # ------------------------------------------------------------------------
 
     xray_flux: Optional[float] = None
-
     hf_fadeout: bool = False
     polar_cap_absorption: bool = False
+
+    # ------------------------------------------------------------------------
+    # Real-time SWS T indices
+    # ------------------------------------------------------------------------
+
+    # Default T-index selected for general propagation use.
+    t_index: Optional[float] = None
+
+    # Human-readable description of where the selected value came from.
+    t_index_source: Optional[str] = None
+
+    # All successfully retrieved regional T indices.
+    t_indices: dict[str, float] = field(
+        default_factory=dict
+    )
+
+    # Time at which our program retrieved the SWS page.
+    t_index_retrieved_utc: Optional[str] = None
+
+    # Time at which SWS says the T-index data was last updated.
+    t_index_updated_utc: Optional[str] = None
 
     # ------------------------------------------------------------------------
     # Alerts
@@ -175,7 +235,6 @@ class SpaceWeatherData:
     # ------------------------------------------------------------------------
 
     sws_available: bool = False
-
     sws_error: Optional[str] = None
 
     # ------------------------------------------------------------------------
@@ -246,6 +305,316 @@ def post_json(
 
 
 # ============================================================================
+# SWS PUBLIC WEBSITE: REAL-TIME T INDICES
+# ============================================================================
+
+def parse_sws_t_index_page(
+    page_html: str,
+) -> tuple[dict[str, float], Optional[str]]:
+    """
+    Parse real-time T-index values from the public SWS webpage.
+
+    The SWS page may publish:
+
+        Northern hemisphere T index
+        Southern hemisphere T index
+        Northern Equatorial Australian Region T index
+        Northern Australian Region T index
+        Southern Australian Region T index
+        Australian Region T index
+        Antarctic Region T index
+
+    SWS uses 999 to indicate that no autoscaled data is available.
+
+    Returns:
+
+        (
+            t_indices,
+            updated_utc,
+        )
+    """
+
+    # ------------------------------------------------------------------------
+    # Convert HTML into searchable text.
+    # ------------------------------------------------------------------------
+
+    page_text = html.unescape(page_html)
+
+    # Remove scripts.
+    page_text = re.sub(
+        r"<script\b[^>]*>.*?</script>",
+        " ",
+        page_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # Remove styles.
+    page_text = re.sub(
+        r"<style\b[^>]*>.*?</style>",
+        " ",
+        page_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # Remove remaining HTML tags.
+    page_text = re.sub(
+        r"<[^>]+>",
+        " ",
+        page_text,
+    )
+
+    # Normalize whitespace.
+    page_text = re.sub(
+        r"\s+",
+        " ",
+        page_text,
+    ).strip()
+
+    # ------------------------------------------------------------------------
+    # Parse T-index values.
+    # ------------------------------------------------------------------------
+
+    number_pattern = r"(-?\d+(?:\.\d+)?)"
+
+    patterns = {
+
+        "northern_hemisphere": (
+            r"Northern\s+hemisphere\s+T\s+index\s*:\s*"
+            + number_pattern
+        ),
+
+        "southern_hemisphere": (
+            r"Southern\s+hemisphere\s+T\s+index\s*:\s*"
+            + number_pattern
+        ),
+
+        "northern_equatorial_australia": (
+            r"Northern\s+Equatorial\s+Australian\s+Region"
+            r"\s+T\s+index\s*:\s*"
+            + number_pattern
+        ),
+
+        "northern_australia": (
+            r"Northern\s+Australian\s+Region"
+            r"\s+T\s+index\s*:\s*"
+            + number_pattern
+        ),
+
+        "southern_australia": (
+            r"Southern\s+Australian\s+Region"
+            r"\s+T\s+index\s*:\s*"
+            + number_pattern
+        ),
+
+        "australian_region": (
+            r"Australian\s+Region\s+T\s+index\s*:\s*"
+            + number_pattern
+        ),
+
+        "antarctic_region": (
+            r"Antarctic\s+Region\s+T\s+index\s*:\s*"
+            + number_pattern
+        ),
+    }
+
+    indices: dict[str, float] = {}
+
+    for name, pattern in patterns.items():
+
+        match = re.search(
+            pattern,
+            page_text,
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            continue
+
+        value = safe_float(
+            match.group(1)
+        )
+
+        if value is None:
+            continue
+
+        # SWS uses 999 to indicate that no autoscaled data is available.
+        if value == 999:
+            continue
+
+        indices[name] = value
+
+    # ------------------------------------------------------------------------
+    # Parse SWS's own "last updated" time.
+    #
+    # Current page format:
+    #
+    #     last updated 24 Sep 2026 04:40 UT
+    #
+    # ------------------------------------------------------------------------
+
+    updated_utc: Optional[str] = None
+
+    updated_match = re.search(
+        r"last\s+updated\s+"
+        r"(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\s+"
+        r"\d{1,2}:\d{2})\s+UT",
+        page_text,
+        flags=re.IGNORECASE,
+    )
+
+    if updated_match:
+
+        parsed = parse_datetime(
+            updated_match.group(1)
+            + " UTC"
+        )
+
+        if parsed is not None:
+            updated_utc = parsed.isoformat()
+
+    # ------------------------------------------------------------------------
+    # Make sure we actually got something useful.
+    # ------------------------------------------------------------------------
+
+    if not indices:
+        raise RuntimeError(
+            "SWS real-time T-index page returned no usable T indices."
+        )
+
+    return (
+        indices,
+        updated_utc,
+    )
+
+
+def get_sws_realtime_t_indices() -> dict[str, Any]:
+    """
+    Retrieve real-time T indices from the public SWS webpage.
+
+    Source:
+        SWS Global HF - Real Time T Indices
+
+    The webpage provides real-time values derived from several hours
+    of autoscaled ionosonde data.
+
+    A value of 999 means that no autoscaled data is available and is
+    therefore ignored.
+
+    Returns:
+
+        {
+            "indices": {...},
+            "updated_utc": "...",
+            "retrieved_utc": "...",
+        }
+
+    The function does not require SWS_API_KEY.
+    """
+
+    retrieved_utc = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    response = requests.get(
+        SWS_REALTIME_T_INDEX_URL,
+        timeout=REQUEST_TIMEOUT,
+        headers={
+            "User-Agent":
+                "HF-Propagation-Assistant/0.1"
+        },
+    )
+
+    response.raise_for_status()
+
+    (
+        indices,
+        updated_utc,
+    ) = parse_sws_t_index_page(
+        response.text
+    )
+
+    return {
+        "indices": indices,
+        "updated_utc": updated_utc,
+        "retrieved_utc": retrieved_utc,
+    }
+
+
+def select_default_t_index(
+    t_indices: dict[str, float],
+) -> tuple[Optional[float], Optional[str]]:
+    """
+    Select the default T-index for the propagation system.
+
+    Primary choice:
+        Southern Hemisphere
+
+    This is appropriate for the project's primary NZ/South Pacific
+    operating region.
+
+    Fallback:
+        Australian Region
+        Southern Australia
+        Northern Australia
+        Northern Hemisphere
+        Antarctic Region
+
+    This function only chooses a default value.
+
+    Path-specific selection should be performed by main.py using the
+    complete t_indices dictionary.
+    """
+
+    preferred = (
+
+        (
+            "southern_hemisphere",
+            "SWS real-time Southern Hemisphere T index",
+        ),
+
+        (
+            "australian_region",
+            "SWS real-time Australian Region T index",
+        ),
+
+        (
+            "southern_australia",
+            "SWS real-time Southern Australian Region T index",
+        ),
+
+        (
+            "northern_australia",
+            "SWS real-time Northern Australian Region T index",
+        ),
+
+        (
+            "northern_hemisphere",
+            "SWS real-time Northern Hemisphere T index",
+        ),
+
+        (
+            "antarctic_region",
+            "SWS real-time Antarctic Region T index",
+        ),
+    )
+
+    for key, source in preferred:
+
+        value = t_indices.get(key)
+
+        if value is not None:
+            return (
+                float(value),
+                source,
+            )
+
+    return (
+        None,
+        None,
+    )
+
+
+# ============================================================================
 # GENERIC VALUE HELPERS
 # ============================================================================
 
@@ -262,7 +631,10 @@ def safe_float(
     try:
         return float(value)
 
-    except (TypeError, ValueError):
+    except (
+        TypeError,
+        ValueError,
+    ):
         return None
 
 
@@ -291,8 +663,11 @@ def latest_record(
 
     if isinstance(data, dict):
 
-        # Common nested data field
-        if isinstance(data.get("data"), list):
+        # Common nested data field.
+        if isinstance(
+            data.get("data"),
+            list,
+        ):
 
             records = [
                 item
@@ -340,7 +715,10 @@ def parse_datetime(
             timezone.utc
         )
 
-    if not isinstance(value, str):
+    if not isinstance(
+        value,
+        str,
+    ):
         return None
 
     text = value.strip()
@@ -355,7 +733,10 @@ def parse_datetime(
     )
 
     if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
+        text = (
+            text[:-1]
+            + "+00:00"
+        )
 
     # First try Python's ISO parser.
     try:
@@ -434,13 +815,13 @@ def extract_alert_issue_time(
         "date_time",
     )
 
-    for field in possible_fields:
+    for field_name in possible_fields:
 
-        if field not in alert:
+        if field_name not in alert:
             continue
 
         parsed = parse_datetime(
-            alert.get(field)
+            alert.get(field_name)
         )
 
         if parsed is not None:
@@ -487,13 +868,13 @@ def extract_alert_expiry_time(
         "end",
     )
 
-    for field in possible_fields:
+    for field_name in possible_fields:
 
-        if field not in alert:
+        if field_name not in alert:
             continue
 
         parsed = parse_datetime(
-            alert.get(field)
+            alert.get(field_name)
         )
 
         if parsed is not None:
@@ -513,21 +894,20 @@ def extract_alert_expiry_time(
     )
 
     combined_text = " ".join(
-        str(alert.get(field, ""))
-        for field in text_fields
+        str(
+            alert.get(
+                field_name,
+                "",
+            )
+        )
+        for field_name in text_fields
     )
 
     if not combined_text:
         return None
 
-    # Examples:
-    #
-    # Valid Until: 2026 Sep 16 1800 UTC
-    # Valid until 2026 Sep 16 1800 UTC
-    #
-    # The regex intentionally allows both abbreviated and full month names.
-
     patterns = (
+
         r"valid\s+until\s*:?\s*"
         r"(\d{4}\s+[A-Za-z]{3,9}\s+\d{1,2}\s+\d{3,4}\s*UTC)",
 
@@ -551,7 +931,6 @@ def extract_alert_expiry_time(
 
         date_text = match.group(1)
 
-        # Convert 1800 -> 18:00 and 900 -> 09:00.
         date_match = re.match(
             r"(\d{4})\s+([A-Za-z]{3,9})\s+"
             r"(\d{1,2})\s+(\d{3,4})\s*UTC",
@@ -567,8 +946,12 @@ def extract_alert_expiry_time(
         day = date_match.group(3)
         time_part = date_match.group(4)
 
+        # Convert 1800 -> 18:00 and 900 -> 09:00.
         if len(time_part) == 3:
-            time_part = "0" + time_part
+            time_part = (
+                "0"
+                + time_part
+            )
 
         normalised = (
             f"{year} {month} {day} "
@@ -604,25 +987,18 @@ def is_alert_current(
     3. If neither expiry nor issue time can be determined:
          keep it rather than silently discarding potentially important
          information.
-
-    The final case is deliberately conservative because different SWS/NOAA
-    products can have unusual structures.
     """
 
     if now_utc is None:
-
         now_utc = datetime.now(
             timezone.utc
         )
 
     if now_utc.tzinfo is None:
-
         now_utc = now_utc.replace(
             tzinfo=timezone.utc
         )
-
     else:
-
         now_utc = now_utc.astimezone(
             timezone.utc
         )
@@ -636,7 +1012,6 @@ def is_alert_current(
     )
 
     if expiry is not None:
-
         return expiry >= now_utc
 
     # ------------------------------------------------------------------------
@@ -649,7 +1024,10 @@ def is_alert_current(
 
     if issue_time is not None:
 
-        age = now_utc - issue_time
+        age = (
+            now_utc
+            - issue_time
+        )
 
         # Future-dated records are retained.
         if age.total_seconds() < 0:
@@ -674,19 +1052,22 @@ def filter_current_alerts(
     """
     Filter a collection of NOAA/SWS alerts down to currently relevant
     records.
-
-    The original records are returned unchanged; this function only decides
-    which records should be exposed to the rest of the application.
     """
 
-    if not isinstance(alerts, list):
+    if not isinstance(
+        alerts,
+        list,
+    ):
         return []
 
     filtered = []
 
     for alert in alerts:
 
-        if not isinstance(alert, dict):
+        if not isinstance(
+            alert,
+            dict,
+        ):
             continue
 
         if is_alert_current(
@@ -694,8 +1075,9 @@ def filter_current_alerts(
             now_utc=now_utc,
             max_age_hours=max_age_hours,
         ):
-
-            filtered.append(alert)
+            filtered.append(
+                alert
+            )
 
     return filtered
 
@@ -715,10 +1097,14 @@ def get_noaa_solar_flux() -> Optional[float]:
     try:
 
         data = get_json(
-            NOAA_ENDPOINTS["solar_radio_flux"]
+            NOAA_ENDPOINTS[
+                "solar_radio_flux"
+            ]
         )
 
-        record = latest_record(data)
+        record = latest_record(
+            data
+        )
 
         if not record:
             return None
@@ -742,7 +1128,6 @@ def get_noaa_solar_flux() -> Optional[float]:
         return None
 
     except Exception:
-
         return None
 
 
@@ -761,7 +1146,9 @@ def get_noaa_f107_fallback() -> Optional[float]:
             NOAA_ENDPOINTS["f107"]
         )
 
-        record = latest_record(data)
+        record = latest_record(
+            data
+        )
 
         if not record:
             return None
@@ -786,7 +1173,6 @@ def get_noaa_f107_fallback() -> Optional[float]:
         return None
 
     except Exception:
-
         return None
 
 
@@ -805,7 +1191,9 @@ def get_noaa_planetary_k() -> Optional[float]:
             NOAA_ENDPOINTS["planetary_k"]
         )
 
-        record = latest_record(data)
+        record = latest_record(
+            data
+        )
 
         if not record:
             return None
@@ -829,7 +1217,6 @@ def get_noaa_planetary_k() -> Optional[float]:
         return None
 
     except Exception:
-
         return None
 
 
@@ -848,7 +1235,9 @@ def get_noaa_dst() -> Optional[float]:
             NOAA_ENDPOINTS["dst"]
         )
 
-        record = latest_record(data)
+        record = latest_record(
+            data
+        )
 
         if not record:
             return None
@@ -872,7 +1261,6 @@ def get_noaa_dst() -> Optional[float]:
         return None
 
     except Exception:
-
         return None
 
 
@@ -891,7 +1279,9 @@ def get_noaa_sunspot_number() -> Optional[float]:
             NOAA_ENDPOINTS["sunspots"]
         )
 
-        record = latest_record(data)
+        record = latest_record(
+            data
+        )
 
         if not record:
             return None
@@ -915,7 +1305,6 @@ def get_noaa_sunspot_number() -> Optional[float]:
         return None
 
     except Exception:
-
         return None
 
 
@@ -927,9 +1316,6 @@ def get_noaa_alerts() -> list[dict[str, Any]]:
     """
     Retrieve NOAA space-weather alerts and filter them to currently relevant
     records.
-
-    The unfiltered response is handled separately by collect_space_weather()
-    and retained under raw["NOAA alerts"].
     """
 
     try:
@@ -938,7 +1324,10 @@ def get_noaa_alerts() -> list[dict[str, Any]]:
             NOAA_ENDPOINTS["alerts"]
         )
 
-        if isinstance(data, list):
+        if isinstance(
+            data,
+            list,
+        ):
 
             return filter_current_alerts(
                 data
@@ -947,7 +1336,6 @@ def get_noaa_alerts() -> list[dict[str, Any]]:
         return []
 
     except Exception:
-
         return []
 
 
@@ -985,7 +1373,6 @@ def sws_request(
     }
 
     if location is not None:
-
         payload["options"] = {
             "location": location,
         }
@@ -1005,19 +1392,6 @@ def get_sws_k_index(
 ) -> Optional[float]:
     """
     Retrieve the latest SWS K index.
-
-    Possible locations include:
-
-        Australian region
-        Hobart
-        Melbourne
-        Sydney
-        Canberra
-        Darwin
-        Perth
-        Learmonth
-        Norfolk Island
-        etc.
     """
 
     try:
@@ -1039,7 +1413,6 @@ def get_sws_k_index(
         )
 
     except Exception:
-
         return None
 
 
@@ -1071,7 +1444,6 @@ def get_sws_a_index() -> Optional[float]:
         )
 
     except Exception:
-
         return None
 
 
@@ -1103,7 +1475,6 @@ def get_sws_dst() -> Optional[float]:
         )
 
     except Exception:
-
         return None
 
 
@@ -1114,9 +1485,6 @@ def get_sws_dst() -> Optional[float]:
 def get_sws_magnetic_alert() -> list[dict[str, Any]]:
     """
     Retrieve current Australian-region magnetic alerts.
-
-    Filtering is applied before the data is returned to the propagation
-    engine.
     """
 
     try:
@@ -1130,7 +1498,10 @@ def get_sws_magnetic_alert() -> list[dict[str, Any]]:
             [],
         )
 
-        if isinstance(data, list):
+        if isinstance(
+            data,
+            list,
+        ):
 
             return filter_current_alerts(
                 data
@@ -1139,7 +1510,6 @@ def get_sws_magnetic_alert() -> list[dict[str, Any]]:
         return []
 
     except Exception:
-
         return []
 
 
@@ -1150,9 +1520,6 @@ def get_sws_magnetic_alert() -> list[dict[str, Any]]:
 def get_sws_magnetic_warning() -> list[dict[str, Any]]:
     """
     Retrieve current Australian-region magnetic warnings.
-
-    Filtering is applied before the data is returned to the propagation
-    engine.
     """
 
     try:
@@ -1166,7 +1533,10 @@ def get_sws_magnetic_warning() -> list[dict[str, Any]]:
             [],
         )
 
-        if isinstance(data, list):
+        if isinstance(
+            data,
+            list,
+        ):
 
             return filter_current_alerts(
                 data
@@ -1175,7 +1545,6 @@ def get_sws_magnetic_warning() -> list[dict[str, Any]]:
         return []
 
     except Exception:
-
         return []
 
 
@@ -1199,7 +1568,10 @@ def get_sws_aurora_watch() -> list[dict[str, Any]]:
             [],
         )
 
-        if isinstance(data, list):
+        if isinstance(
+            data,
+            list,
+        ):
 
             return filter_current_alerts(
                 data
@@ -1208,7 +1580,6 @@ def get_sws_aurora_watch() -> list[dict[str, Any]]:
         return []
 
     except Exception:
-
         return []
 
 
@@ -1232,7 +1603,10 @@ def get_sws_aurora_outlook() -> list[dict[str, Any]]:
             [],
         )
 
-        if isinstance(data, list):
+        if isinstance(
+            data,
+            list,
+        ):
 
             return filter_current_alerts(
                 data
@@ -1241,7 +1615,6 @@ def get_sws_aurora_outlook() -> list[dict[str, Any]]:
         return []
 
     except Exception:
-
         return []
 
 
@@ -1257,8 +1630,9 @@ def collect_space_weather() -> SpaceWeatherData:
 
     If one service fails, the remaining services are still used.
 
-    Alerts are filtered inside this module so downstream code receives
-    currently relevant information rather than historical API records.
+    The public SWS T-index webpage is queried independently of the SWS API
+    key. This means the T-index can still be available even if the SWS API
+    credentials are not configured.
     """
 
     retrieved_dt = datetime.now(
@@ -1267,8 +1641,77 @@ def collect_space_weather() -> SpaceWeatherData:
 
     retrieved = retrieved_dt.isoformat()
 
-    status = {}
-    raw = {}
+    status: dict[str, str] = {}
+    raw: dict[str, Any] = {}
+
+    # ------------------------------------------------------------------------
+    # SWS REAL-TIME T INDICES
+    #
+    # This is deliberately performed independently of SWS_API_KEY.
+    # The public SWS webpage does not require the authenticated API.
+    # ------------------------------------------------------------------------
+
+    try:
+
+        t_index_result = (
+            get_sws_realtime_t_indices()
+        )
+
+        t_indices = t_index_result.get(
+            "indices",
+            {},
+        )
+
+        t_index_updated_utc = (
+            t_index_result.get(
+                "updated_utc"
+            )
+        )
+
+        t_index_retrieved_utc = (
+            t_index_result.get(
+                "retrieved_utc"
+            )
+        )
+
+        (
+            t_index,
+            t_index_source,
+        ) = select_default_t_index(
+            t_indices
+        )
+
+        if t_index is not None:
+            status["SWS T index"] = "OK"
+        else:
+            status["SWS T index"] = "FAILED"
+
+    except Exception as exc:
+
+        t_indices = {}
+        t_index = None
+        t_index_source = None
+        t_index_updated_utc = None
+
+        t_index_retrieved_utc = (
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+        )
+
+        status["SWS T index"] = "FAILED"
+
+        raw["SWS T index error"] = str(
+            exc
+        )
+
+    raw["SWS real-time T indices"] = (
+        t_indices
+    )
+
+    raw["SWS T index updated UTC"] = (
+        t_index_updated_utc
+    )
 
     # ------------------------------------------------------------------------
     # NOAA F10.7
@@ -1277,7 +1720,6 @@ def collect_space_weather() -> SpaceWeatherData:
     solar_flux = get_noaa_solar_flux()
 
     if solar_flux is None:
-
         solar_flux = (
             get_noaa_f107_fallback()
         )
@@ -1326,12 +1768,12 @@ def collect_space_weather() -> SpaceWeatherData:
 
     # ------------------------------------------------------------------------
     # NOAA alerts
-    # ------------------------------------------------------------------------
-
+    #
     # Retrieve the complete API response first.
     #
     # This is important because raw data should remain available for
     # debugging, historical analysis and future improvements to the filter.
+    # ------------------------------------------------------------------------
 
     try:
 
@@ -1339,16 +1781,21 @@ def collect_space_weather() -> SpaceWeatherData:
             NOAA_ENDPOINTS["alerts"]
         )
 
-        if isinstance(noaa_alert_response, list):
+        if isinstance(
+            noaa_alert_response,
+            list,
+        ):
 
             noaa_alerts_raw = [
                 item
                 for item in noaa_alert_response
-                if isinstance(item, dict)
+                if isinstance(
+                    item,
+                    dict,
+                )
             ]
 
         else:
-
             noaa_alerts_raw = []
 
     except Exception:
@@ -1362,10 +1809,12 @@ def collect_space_weather() -> SpaceWeatherData:
 
     status["NOAA alerts"] = "OK"
 
-    raw["NOAA alerts"] = noaa_alerts_raw
+    raw["NOAA alerts"] = (
+        noaa_alerts_raw
+    )
 
     # ------------------------------------------------------------------------
-    # SWS
+    # SWS AUTHENTICATED API
     # ------------------------------------------------------------------------
 
     sws_key_available = bool(
@@ -1399,7 +1848,6 @@ def collect_space_weather() -> SpaceWeatherData:
         )
 
         sws_available = True
-
         sws_error = None
 
         status["SWS K"] = (
@@ -1453,7 +1901,9 @@ def collect_space_weather() -> SpaceWeatherData:
             "SWS_API_KEY is not configured."
         )
 
-        status["SWS"] = "NOT CONFIGURED"
+        status["SWS"] = (
+            "NOT CONFIGURED"
+        )
 
     # ------------------------------------------------------------------------
     # Create normalised result
@@ -1464,9 +1914,11 @@ def collect_space_weather() -> SpaceWeatherData:
         retrieved_utc=retrieved,
 
         solar_flux_10_7=solar_flux,
+
         sunspot_number=sunspots,
 
         planetary_k_index=planetary_k,
+
         australian_k_index=australian_k,
 
         a_index=a_index,
@@ -1478,6 +1930,30 @@ def collect_space_weather() -> SpaceWeatherData:
             else dst
         ),
 
+        xray_flux=None,
+
+        hf_fadeout=False,
+
+        polar_cap_absorption=False,
+
+        # --------------------------------------------------------------------
+        # Real-time SWS T-index
+        # --------------------------------------------------------------------
+
+        t_index=t_index,
+
+        t_index_source=t_index_source,
+
+        t_indices=t_indices,
+
+        t_index_retrieved_utc=(
+            t_index_retrieved_utc
+        ),
+
+        t_index_updated_utc=(
+            t_index_updated_utc
+        ),
+
         active_alerts=noaa_alerts,
 
         active_warnings=(
@@ -1485,6 +1961,7 @@ def collect_space_weather() -> SpaceWeatherData:
         ),
 
         sws_available=sws_available,
+
         sws_error=sws_error,
 
         source_status=status,
@@ -1516,12 +1993,13 @@ def to_propagation_inputs(
     import importlib
 
     propagation_inputs_type = getattr(
-        importlib.import_module("band_favorability"),
+        importlib.import_module(
+            "band_favorability"
+        ),
         "PropagationInputs",
     )
 
     if timestamp_utc is None:
-
         timestamp_utc = datetime.now(
             timezone.utc
         )
@@ -1529,6 +2007,7 @@ def to_propagation_inputs(
     return propagation_inputs_type(
 
         latitude=latitude,
+
         longitude=longitude,
 
         timestamp_utc=timestamp_utc,
@@ -1577,12 +2056,16 @@ def print_summary(
     print("=" * 65)
     print("HF PROPAGATION SPACE-WEATHER DATA")
     print("=" * 65)
-
     print()
+
     print("Retrieved:")
     print(
         f"  {weather.retrieved_utc}"
     )
+
+    # ------------------------------------------------------------------------
+    # SOLAR
+    # ------------------------------------------------------------------------
 
     print()
     print("SOLAR")
@@ -1598,6 +2081,10 @@ def print_summary(
         f"{weather.sunspot_number}"
     )
 
+    # ------------------------------------------------------------------------
+    # GEOMAGNETIC
+    # ------------------------------------------------------------------------
+
     print()
     print("GEOMAGNETIC")
     print("-" * 65)
@@ -1608,8 +2095,8 @@ def print_summary(
     )
 
     print(
-        f"  Australian K:"
-        f" {weather.australian_k_index}"
+        f"  Australian K: "
+        f"{weather.australian_k_index}"
     )
 
     print(
@@ -1621,6 +2108,63 @@ def print_summary(
         f"  Dst:          "
         f"{weather.dst_index}"
     )
+
+    # ------------------------------------------------------------------------
+    # T INDEX
+    # ------------------------------------------------------------------------
+
+    print()
+    print("REAL-TIME T INDICES")
+    print("-" * 65)
+
+    print(
+        f"  Selected T:   "
+        f"{weather.t_index}"
+    )
+
+    print(
+        f"  Source:       "
+        f"{weather.t_index_source}"
+    )
+
+    print(
+        f"  SWS updated:  "
+        f"{weather.t_index_updated_utc}"
+    )
+
+    print(
+        f"  Retrieved:    "
+        f"{weather.t_index_retrieved_utc}"
+    )
+
+    if weather.t_indices:
+
+        for name, value in (
+            weather.t_indices.items()
+        ):
+
+            display_name = (
+                name.replace(
+                    "_",
+                    " ",
+                )
+                .title()
+            )
+
+            print(
+                f"  {display_name + ':':<36}"
+                f"{value}"
+            )
+
+    else:
+
+        print(
+            "  No real-time T-index data available."
+        )
+
+    # ------------------------------------------------------------------------
+    # ALERTS
+    # ------------------------------------------------------------------------
 
     print()
     print("ALERTS")
@@ -1637,9 +2181,13 @@ def print_summary(
     )
 
     print(
-        f"  SWS available:"
+        f"  SWS API available:"
         f" {weather.sws_available}"
     )
+
+    # ------------------------------------------------------------------------
+    # SOURCE STATUS
+    # ------------------------------------------------------------------------
 
     print()
     print("SOURCE STATUS")
@@ -1650,14 +2198,14 @@ def print_summary(
     ).items():
 
         print(
-            f"  {source:<20} {status}"
+            f"  {source:<28} {status}"
         )
 
     if weather.sws_error:
 
         print()
         print(
-            f"SWS: {weather.sws_error}"
+            f"SWS API: {weather.sws_error}"
         )
 
     print()
@@ -1709,6 +2257,7 @@ if __name__ == "__main__":
     )
 
     print()
+
     print(
         "Saved: space_weather.json"
     )

@@ -2,7 +2,7 @@
 RadioPathwayTool - Main Propagation Engine
 
 This module is the orchestration layer between the individual data sources
-and the Discord bot.
+and the Discord bot / AI assistant.
 
 Architecture:
 
@@ -12,6 +12,8 @@ Architecture:
             |
     band_favorability.py
             |
+    propagation_engine.py
+            |
             v
          main.py
             |
@@ -20,25 +22,48 @@ Architecture:
             +--> human-readable text
             |
             v
-      discord_bot.py
+       discord_bot.py
+       ai_assistant.py
 
 Important design principles:
 
-1. HAP is the primary HF propagation prediction.
-2. Space weather is supporting context, not an arbitrary score.
-3. Live ionospheric observations are supporting evidence.
-4. No 0-100 band score is generated here.
-5. main.py does not contain Discord-specific code.
-6. Importing main.py does not automatically perform network requests.
-7. Individual data sources can fail without necessarily killing the
+1. HAP is the primary HF propagation prediction for the transmitter/base
+   location.
+
+2. GRAFEX is used when a specific TX -> RX path is supplied.
+
+3. Space weather is supporting context, not an arbitrary score.
+
+4. Live ionospheric observations are supporting evidence.
+
+5. No 0-100 band score is generated here.
+
+6. main.py does not contain Discord-specific code.
+
+7. Importing main.py does not automatically perform network requests.
+
+8. Individual data sources can fail without necessarily killing the
    entire propagation report.
+
+9. GRAFEX is optional. A normal propagation report does not require
+   TX/RX path information.
+
+10. K-index values are NOT automatically treated as GRAFEX T-index values.
+    GRAFEX is only requested when a usable T-index is available.
+
+11. T-index values come directly from the SWS real-time T-index data
+    collected by space_weather.py.
+
+12. For cross-region paths, the lower applicable SWS T-index is used where
+    both regional values are available.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass
+from datetime import date, datetime, timezone
 from typing import Any, Optional
+
 import re
 
 
@@ -47,11 +72,18 @@ import re
 # ---------------------------------------------------------------------------
 
 from space_weather import collect_space_weather
+
 from ionosphere import get_all_ionosphere_observations
+
 from band_favorability import (
     HAPCollector,
     HAPDecoder,
     HAPConfig,
+)
+
+from propagation_engine import (
+    LocationResolver,
+    PropagationEngine,
 )
 
 
@@ -60,9 +92,7 @@ from band_favorability import (
 # ---------------------------------------------------------------------------
 
 LOCATION_NAME = "Nelson"
-
 LOCATION_LATITUDE = -41.27
-
 LOCATION_LONGITUDE = 173.28
 
 # The HAP system currently uses the nine frequencies supplied to the
@@ -79,12 +109,22 @@ HAP_FREQUENCIES_KHZ = [
     28850,
 ]
 
-# How many degrees around the requested location should the HAP grid cover.
+# HAP grid centred around the requested transmitter location.
 HAP_GRID_ROWS = 7
 HAP_GRID_COLS = 7
-
 HAP_GRID_STEP_LAT = 5.0
 HAP_GRID_STEP_LON = 5.0
+
+
+# ---------------------------------------------------------------------------
+# LONG-LIVED PROPAGATION SERVICES
+# ---------------------------------------------------------------------------
+
+# Keep these alive at module level so their internal caches can persist
+# between report requests.
+
+LOCATION_RESOLVER = LocationResolver()
+PROPAGATION_ENGINE = PropagationEngine()
 
 
 # ---------------------------------------------------------------------------
@@ -100,10 +140,12 @@ class DataStatus:
     hap_available: bool = False
     ionosphere_available: bool = False
     space_weather_available: bool = False
+    grafex_available: bool = False
 
     hap_error: Optional[str] = None
     ionosphere_error: Optional[str] = None
     space_weather_error: Optional[str] = None
+    grafex_error: Optional[str] = None
 
 
 @dataclass
@@ -111,18 +153,41 @@ class PropagationReport:
     """
     Complete result returned by get_propagation_report().
 
-    The Discord bot should consume this object rather than having to know
-    anything about HAP decoding, SWS URLs, or the individual data modules.
+    GRAFEX is optional.
+
+    If rx_location is None, this is a normal local/base-point propagation
+    report.
+
+    If rx_location is supplied, grafex contains the path-specific GRAFEX
+    prediction when it can be obtained.
     """
+
+    # -----------------------------------------------------------------------
+    # Primary transmitter/base location
+    # -----------------------------------------------------------------------
 
     location_name: str
     latitude: float
     longitude: float
 
+    # -----------------------------------------------------------------------
+    # Optional path information
+    # -----------------------------------------------------------------------
+
+    tx_location: str
+    rx_location: Optional[str]
+
+    # -----------------------------------------------------------------------
+    # Timing
+    # -----------------------------------------------------------------------
+
     generated_utc: str
     generated_local: str
-
     current_utc_hour: int
+
+    # -----------------------------------------------------------------------
+    # HAP
+    # -----------------------------------------------------------------------
 
     current_band: Optional[str]
     current_frequency_mhz: Optional[float]
@@ -134,12 +199,24 @@ class PropagationReport:
 
     regional_distribution: dict[str, int]
 
-    ionosphere_observations: list[dict[str, Any]]
+    # -----------------------------------------------------------------------
+    # Supporting data
+    # -----------------------------------------------------------------------
 
+    ionosphere_observations: list[dict[str, Any]]
     space_weather: dict[str, Any]
 
-    data_status: DataStatus
+    # -----------------------------------------------------------------------
+    # Path-specific GRAFEX
+    # -----------------------------------------------------------------------
 
+    grafex: Optional[dict[str, Any]]
+
+    # -----------------------------------------------------------------------
+    # Status + text
+    # -----------------------------------------------------------------------
+
+    data_status: DataStatus
     text: str
 
 
@@ -151,7 +228,6 @@ def get_current_utc() -> datetime:
     """
     Return the current timezone-aware UTC datetime.
     """
-
     return datetime.now(timezone.utc)
 
 
@@ -159,10 +235,8 @@ def format_local_time(dt: datetime) -> str:
     """
     Format the supplied datetime for the local NZ user-facing report.
 
-    We deliberately do not hard-code NZST/NZDT because the date determines
-    whether New Zealand is currently observing daylight saving.
+    New Zealand daylight saving is handled automatically by ZoneInfo.
     """
-
     try:
         from zoneinfo import ZoneInfo
 
@@ -175,10 +249,86 @@ def format_local_time(dt: datetime) -> str:
         )
 
     except Exception:
-        # Fallback if zoneinfo is unavailable.
         return dt.strftime(
             "%d %b %Y %H:%M UTC"
         )
+
+
+# ---------------------------------------------------------------------------
+# LOCATION HELPERS
+# ---------------------------------------------------------------------------
+
+def resolve_location(
+    location_name: str,
+) -> tuple[str, float, float]:
+    """
+    Resolve a human-readable location into:
+
+        (display_name, latitude, longitude)
+
+    Uses the LocationResolver from propagation_engine.py.
+    """
+
+    result = LOCATION_RESOLVER.resolve(
+        location_name
+    )
+
+    # Object-style result.
+    if hasattr(result, "latitude") and hasattr(
+        result,
+        "longitude",
+    ):
+        latitude = float(result.latitude)
+        longitude = float(result.longitude)
+
+        display_name = getattr(
+            result,
+            "display_name",
+            location_name,
+        )
+
+        return (
+            str(display_name),
+            latitude,
+            longitude,
+        )
+
+    # Dictionary-style result.
+    if isinstance(result, dict):
+        latitude = float(
+            result["latitude"]
+        )
+
+        longitude = float(
+            result["longitude"]
+        )
+
+        display_name = result.get(
+            "display_name",
+            location_name,
+        )
+
+        return (
+            str(display_name),
+            latitude,
+            longitude,
+        )
+
+    # Tuple/list-style result.
+    if isinstance(result, (tuple, list)) and len(result) >= 2:
+        latitude = float(result[0])
+        longitude = float(result[1])
+
+        return (
+            location_name,
+            latitude,
+            longitude,
+        )
+
+    raise ValueError(
+        f"Unsupported location resolver result for "
+        f"{location_name!r}: {type(result).__name__}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -187,18 +337,24 @@ def format_local_time(dt: datetime) -> str:
 
 def create_hap_config(
     current_time: datetime,
+    location_name: str = LOCATION_NAME,
+    latitude: float = LOCATION_LATITUDE,
+    longitude: float = LOCATION_LONGITUDE,
 ) -> HAPConfig:
     """
-    Create the HAP configuration centred on Nelson.
+    Create the HAP configuration centred on the requested transmitter
+    location.
 
-    The SWS HAP system returns all 24 UTC hours, so the exact current hour
-    does not need to be requested separately here.
+    For a normal report, this defaults to Nelson.
+
+    For a path-specific report, HAP is centred on the TX location while
+    GRAFEX handles the complete TX -> RX path.
     """
 
     return HAPCollector.create_centred_config(
-        base_name=LOCATION_NAME,
-        base_lat=LOCATION_LATITUDE,
-        base_lon=LOCATION_LONGITUDE,
+        base_name=location_name,
+        base_lat=latitude,
+        base_lon=longitude,
         nrows=HAP_GRID_ROWS,
         ncols=HAP_GRID_COLS,
         step_lat=HAP_GRID_STEP_LAT,
@@ -208,18 +364,22 @@ def create_hap_config(
 
 def collect_hap(
     current_time: datetime,
+    location_name: str = LOCATION_NAME,
+    latitude: float = LOCATION_LATITUDE,
+    longitude: float = LOCATION_LONGITUDE,
 ) -> tuple[Any, Any]:
     """
     Collect and decode the complete HAP forecast.
 
     Returns:
         (config, decoded_hap)
-
-    Raises an exception if the HAP system cannot be collected.
     """
 
     config = create_hap_config(
-        current_time
+        current_time=current_time,
+        location_name=location_name,
+        latitude=latitude,
+        longitude=longitude,
     )
 
     collector = HAPCollector()
@@ -246,10 +406,6 @@ def get_hap_hour(
 ) -> Any:
     """
     Return the decoded HAP data for a particular UTC hour.
-
-    The decoder's recommendation helpers expect the complete decoded
-    dictionary plus the requested UTC hour, so this function simply
-    validates that the hour exists and returns it.
     """
 
     return decoded_hap[hour_utc]
@@ -265,18 +421,17 @@ def extract_hap_base_recommendation(
     Optional[int],
 ]:
     """
-    Extract the HAP recommendation for the Nelson base point.
+    Extract the HAP recommendation for the transmitter/base point.
 
     Returns:
         band
         frequency MHz
         support
 
-    If the decoder has no usable result, all three values are None.
+    If no usable recommendation exists, all three values are None.
     """
 
     try:
-
         recommendation = decoder.get_base_recommendation(
             decoded=decoded_hap,
             hour_utc=hour_utc,
@@ -331,7 +486,6 @@ def extract_regional_distribution(
     """
 
     try:
-
         distribution = decoder.get_regional_distribution(
             decoded=decoded_hap,
             hour_utc=hour_utc,
@@ -359,25 +513,13 @@ def find_next_hap_transition(
     Optional[float],
 ]:
     """
-    Find the next UTC hour at which the HAP recommendation at the Nelson
-    base point changes.
+    Find the next UTC hour at which the HAP recommendation at the
+    transmitter/base point changes.
 
     Searches forward through the next 23 hours.
-
-    Returns:
-        transition_hour
-        band
-        frequency MHz
     """
 
     try:
-
-        get_hap_hour(
-            decoder,
-            decoded_hap,
-            current_hour,
-        )
-
         current_band, _, _ = (
             extract_hap_base_recommendation(
                 decoder,
@@ -390,16 +532,9 @@ def find_next_hap_transition(
             return None, None, None
 
         for offset in range(1, 24):
-
             hour = (
                 current_hour + offset
             ) % 24
-
-            get_hap_hour(
-                decoder,
-                decoded_hap,
-                hour,
-            )
 
             (
                 band,
@@ -415,7 +550,6 @@ def find_next_hap_transition(
                 continue
 
             if band != current_band:
-
                 return (
                     hour,
                     band,
@@ -432,6 +566,73 @@ def find_next_hap_transition(
 # SPACE WEATHER HELPERS
 # ---------------------------------------------------------------------------
 
+def _numeric(value: Any) -> Optional[float]:
+    """
+    Safely convert a value to float.
+    """
+
+    try:
+        if value is None:
+            return None
+
+        return float(value)
+
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_t_indices_from_weather(
+    weather: Any,
+) -> dict[str, float]:
+    """
+    Extract the direct SWS T-index dictionary from SpaceWeatherData.
+
+    space_weather.py now stores the live SWS values in:
+
+        weather.t_indices
+
+    Expected keys:
+
+        northern_hemisphere
+        southern_hemisphere
+        northern_equatorial_australia
+        northern_australia
+        southern_australia
+        australian_region
+        antarctic_region
+
+    No K-index conversion is performed here.
+    """
+
+    raw_indices = getattr(
+        weather,
+        "t_indices",
+        None,
+    )
+
+    if not isinstance(
+        raw_indices,
+        dict,
+    ):
+        return {}
+
+    result: dict[str, float] = {}
+
+    for key, value in raw_indices.items():
+        numeric_value = _numeric(value)
+
+        if numeric_value is None:
+            continue
+
+        # 999 is the SWS missing/unusable sentinel.
+        if numeric_value == 999:
+            continue
+
+        result[str(key)] = numeric_value
+
+    return result
+
+
 def build_space_weather_report(
     weather: Any,
 ) -> dict[str, Any]:
@@ -440,9 +641,104 @@ def build_space_weather_report(
 
     This intentionally exposes the measurements rather than converting them
     into a propagation score.
+
+    T-index values are read directly from space_weather.py.
+
+    We do NOT derive T-index values from K-index.
     """
 
+    t_indices = _get_t_indices_from_weather(
+        weather
+    )
+
+    # -----------------------------------------------------------------------
+    # Direct regional T-index values
+    # -----------------------------------------------------------------------
+
+    t_index_northern = t_indices.get(
+        "northern_hemisphere"
+    )
+
+    t_index_southern = t_indices.get(
+        "southern_hemisphere"
+    )
+
+    t_index_northern_equatorial_australia = (
+        t_indices.get(
+            "northern_equatorial_australia"
+        )
+    )
+
+    t_index_northern_australia = (
+        t_indices.get(
+            "northern_australia"
+        )
+    )
+
+    t_index_southern_australia = (
+        t_indices.get(
+            "southern_australia"
+        )
+    )
+
+    t_index_australian_region = (
+        t_indices.get(
+            "australian_region"
+        )
+    )
+
+    t_index_antarctic = t_indices.get(
+        "antarctic_region"
+    )
+
+    # -----------------------------------------------------------------------
+    # NZ compatibility
+    #
+    # The public SWS page does not necessarily expose a dedicated NZ T-index.
+    # If space_weather.py provides one in the future, use it.
+    #
+    # Otherwise use Southern Hemisphere as the NZ regional fallback.
+    # -----------------------------------------------------------------------
+
+    t_index_nz = (
+        t_indices.get("new_zealand")
+        or t_indices.get("nz")
+        or t_indices.get("tnz")
+    )
+
+    if t_index_nz is None:
+        t_index_nz = t_index_southern
+
+    # -----------------------------------------------------------------------
+    # Generic/default T-index
+    #
+    # space_weather.py already selects a sensible default T-index.
+    # Preserve that value when available.
+    # -----------------------------------------------------------------------
+
+    t_index = _numeric(
+        getattr(
+            weather,
+            "t_index",
+            None,
+        )
+    )
+
+    if t_index is None:
+        t_index = (
+            t_index_southern
+            or t_index_australian_region
+            or t_index_southern_australia
+            or t_index_northern_australia
+            or t_index_northern
+            or t_index_antarctic
+        )
+
     return {
+        # -------------------------------------------------------------------
+        # Standard space-weather measurements
+        # -------------------------------------------------------------------
+
         "retrieved_utc": getattr(
             weather,
             "retrieved_utc",
@@ -503,6 +799,10 @@ def build_space_weather_report(
             None,
         ),
 
+        # -------------------------------------------------------------------
+        # Alerts
+        # -------------------------------------------------------------------
+
         "active_alerts": getattr(
             weather,
             "active_alerts",
@@ -515,6 +815,10 @@ def build_space_weather_report(
             [],
         ),
 
+        # -------------------------------------------------------------------
+        # SWS status
+        # -------------------------------------------------------------------
+
         "sws_available": getattr(
             weather,
             "sws_available",
@@ -526,7 +830,349 @@ def build_space_weather_report(
             "sws_error",
             None,
         ),
+
+        "source_status": getattr(
+            weather,
+            "source_status",
+            {},
+        ),
+
+        # -------------------------------------------------------------------
+        # T-index data
+        # -------------------------------------------------------------------
+
+        "t_index": t_index,
+
+        "t_indices": t_indices,
+
+        "t_index_source": getattr(
+            weather,
+            "t_index_source",
+            None,
+        ),
+
+        "t_index_retrieved_utc": getattr(
+            weather,
+            "t_index_retrieved_utc",
+            None,
+        ),
+
+        "t_index_updated_utc": getattr(
+            weather,
+            "t_index_updated_utc",
+            None,
+        ),
+
+        # Compatibility / convenient named fields.
+        "t_index_nz": t_index_nz,
+
+        "t_index_australia": (
+            t_index_australian_region
+            or t_index_southern_australia
+            or t_index_northern_australia
+        ),
+
+        "t_index_australian_region": (
+            t_index_australian_region
+        ),
+
+        "t_index_southern_australia": (
+            t_index_southern_australia
+        ),
+
+        "t_index_northern_australia": (
+            t_index_northern_australia
+        ),
+
+        "t_index_northern_equatorial_australia": (
+            t_index_northern_equatorial_australia
+        ),
+
+        "t_index_southern_hemisphere": (
+            t_index_southern
+        ),
+
+        "t_index_northern_hemisphere": (
+            t_index_northern
+        ),
+
+        "t_index_antarctic": (
+            t_index_antarctic
+        ),
     }
+
+
+def extract_grafex_t_index(
+    tx_location: str,
+    rx_location: str,
+    weather: Any,
+    weather_report: dict[str, Any],
+) -> Optional[float]:
+    """
+    Select the most appropriate direct SWS T-index for a GRAFEX
+    TX -> RX path.
+
+    IMPORTANT:
+        This function NEVER converts K-index into T-index.
+
+    Selection:
+
+    NZ <-> Australia:
+        Lower of the NZ/Southern Hemisphere and Australian regional
+        T-indices when both are available.
+
+    NZ <-> NZ:
+        NZ-specific T-index if available, otherwise Southern Hemisphere.
+
+    Australia <-> Australia:
+        Australian regional T-index.
+
+    Other Southern Hemisphere:
+        Southern Hemisphere T-index.
+
+    Other Northern Hemisphere:
+        Northern Hemisphere T-index.
+
+    Antarctic:
+        Antarctic T-index.
+
+    Generic:
+        SpaceWeatherData's selected default T-index.
+
+    The lower-value selection for cross-region paths follows SWS guidance
+    for communications between different regions during disturbed
+    conditions.
+    """
+
+    # -----------------------------------------------------------------------
+    # Get direct SWS T-index values.
+    # -----------------------------------------------------------------------
+
+    t_indices = weather_report.get(
+        "t_indices",
+        {},
+    )
+
+    if not isinstance(
+        t_indices,
+        dict,
+    ):
+        t_indices = {}
+
+    def get_index(
+        *keys: str,
+    ) -> Optional[float]:
+
+        for key in keys:
+            value = _numeric(
+                t_indices.get(key)
+            )
+
+            if value is not None:
+                return value
+
+        return None
+
+    # NZ:
+    #
+    # The current public SWS page may not provide a dedicated NZ value.
+    # Southern Hemisphere is therefore the valid fallback.
+    t_index_nz = get_index(
+        "new_zealand",
+        "nz",
+        "tnz",
+    )
+
+    if t_index_nz is None:
+        t_index_nz = _numeric(
+            weather_report.get(
+                "t_index_nz"
+            )
+        )
+
+    if t_index_nz is None:
+        t_index_nz = get_index(
+            "southern_hemisphere"
+        )
+
+    # Australia.
+    t_index_australia = get_index(
+        "australian_region",
+        "southern_australia",
+        "northern_australia",
+        "northern_equatorial_australia",
+    )
+
+    if t_index_australia is None:
+        t_index_australia = _numeric(
+            weather_report.get(
+                "t_index_australia"
+            )
+        )
+
+    # Southern Hemisphere.
+    t_index_southern = get_index(
+        "southern_hemisphere"
+    )
+
+    if t_index_southern is None:
+        t_index_southern = _numeric(
+            weather_report.get(
+                "t_index_southern_hemisphere"
+            )
+        )
+
+    # Northern Hemisphere.
+    t_index_northern = get_index(
+        "northern_hemisphere"
+    )
+
+    if t_index_northern is None:
+        t_index_northern = _numeric(
+            weather_report.get(
+                "t_index_northern_hemisphere"
+            )
+        )
+
+    # Antarctic.
+    t_index_antarctic = get_index(
+        "antarctic_region"
+    )
+
+    if t_index_antarctic is None:
+        t_index_antarctic = _numeric(
+            weather_report.get(
+                "t_index_antarctic"
+            )
+        )
+
+    # Generic direct T-index.
+    generic_t_index = _numeric(
+        weather_report.get(
+            "t_index"
+        )
+    )
+
+    # -----------------------------------------------------------------------
+    # Normalise location names.
+    # -----------------------------------------------------------------------
+
+    tx = (
+        tx_location.strip().casefold()
+    )
+
+    rx = (
+        rx_location.strip().casefold()
+    )
+
+    def is_new_zealand(
+        location: str,
+    ) -> bool:
+        return (
+            "new zealand" in location
+            or location.endswith(", nz")
+            or location == "nz"
+        )
+
+    def is_australia(
+        location: str,
+    ) -> bool:
+        return (
+            "australia" in location
+            or location.endswith(", au")
+            or location == "au"
+        )
+
+    tx_nz = is_new_zealand(tx)
+    rx_nz = is_new_zealand(rx)
+
+    tx_aus = is_australia(tx)
+    rx_aus = is_australia(rx)
+
+    # -----------------------------------------------------------------------
+    # NZ <-> Australia
+    # -----------------------------------------------------------------------
+
+    nz_to_australia = (
+        (tx_nz and rx_aus)
+        or
+        (tx_aus and rx_nz)
+    )
+
+    if nz_to_australia:
+        available = [
+            value
+            for value in (
+                t_index_nz,
+                t_index_australia,
+            )
+            if value is not None
+        ]
+
+        if available:
+            return min(
+                available
+            )
+
+        if t_index_southern is not None:
+            return t_index_southern
+
+        return generic_t_index
+
+    # -----------------------------------------------------------------------
+    # New Zealand -> New Zealand
+    # -----------------------------------------------------------------------
+
+    if tx_nz and rx_nz:
+
+        if t_index_nz is not None:
+            return t_index_nz
+
+        if t_index_southern is not None:
+            return t_index_southern
+
+        return generic_t_index
+
+    # -----------------------------------------------------------------------
+    # Australia -> Australia
+    # -----------------------------------------------------------------------
+
+    if tx_aus and rx_aus:
+
+        if t_index_australia is not None:
+            return t_index_australia
+
+        if t_index_southern is not None:
+            return t_index_southern
+
+        return generic_t_index
+
+    # -----------------------------------------------------------------------
+    # Generic Southern Hemisphere
+    # -----------------------------------------------------------------------
+
+    if t_index_southern is not None:
+        return t_index_southern
+
+    # -----------------------------------------------------------------------
+    # Generic Northern Hemisphere
+    # -----------------------------------------------------------------------
+
+    if t_index_northern is not None:
+        return t_index_northern
+
+    # -----------------------------------------------------------------------
+    # Antarctic
+    # -----------------------------------------------------------------------
+
+    if t_index_antarctic is not None:
+        return t_index_antarctic
+
+    # -----------------------------------------------------------------------
+    # Generic direct T-index
+    # -----------------------------------------------------------------------
+
+    return generic_t_index
 
 
 # ---------------------------------------------------------------------------
@@ -539,9 +1185,6 @@ def build_ionosphere_report(
     """
     Convert ionospheric observations into simple dictionaries suitable for
     Discord/JSON.
-
-    Stations with no useful data are retained so the user can see that the
-    station was checked but did not provide a usable observation.
     """
 
     result = []
@@ -557,21 +1200,17 @@ def build_ionosphere_report(
         if percent is not None:
 
             if percent > 0:
-
                 condition_text = (
                     f"{getattr(observation, 'condition', 'unknown')} "
                     f"(+{percent:.0f}%)"
                 )
-
             else:
-
                 condition_text = (
                     f"{getattr(observation, 'condition', 'unknown')} "
                     f"({percent:.0f}%)"
                 )
 
         else:
-
             condition_text = getattr(
                 observation,
                 "condition",
@@ -633,6 +1272,102 @@ def build_ionosphere_report(
 
 
 # ---------------------------------------------------------------------------
+# GRAFEX HELPERS
+# ---------------------------------------------------------------------------
+
+def run_grafex_path_prediction(
+    tx_location: str,
+    rx_location: str,
+    prediction_date: date,
+    t_index: Optional[float],
+) -> tuple[
+    Optional[dict[str, Any]],
+    Optional[str],
+]:
+    """
+    Run a path-specific GRAFEX prediction.
+
+    Returns:
+        (prediction_dict, error)
+
+    GRAFEX is deliberately isolated from the rest of the propagation
+    pipeline so a path prediction failure does not kill HAP, ionosphere,
+    or space-weather data.
+    """
+
+    if not tx_location.strip():
+        return (
+            None,
+            "TX location was empty.",
+        )
+
+    if not rx_location.strip():
+        return (
+            None,
+            "RX location was empty.",
+        )
+
+    if t_index is None:
+        return (
+            None,
+            "GRAFEX requires a direct SWS T-index, but the current "
+            "space-weather data source did not provide one. "
+            "K-index is not substituted for T-index.",
+        )
+
+    try:
+
+        prediction = PROPAGATION_ENGINE.calculate_path(
+            tx_location=tx_location,
+            rx_location=rx_location,
+            prediction_date=prediction_date,
+            t_index=t_index,
+        )
+
+        if prediction is None:
+            return (
+                None,
+                "GRAFEX returned no prediction.",
+            )
+
+        # Dataclass result.
+        try:
+            prediction_dict = asdict(
+                prediction
+            )
+
+        except Exception:
+
+            # Dictionary result.
+            if isinstance(
+                prediction,
+                dict,
+            ):
+                prediction_dict = prediction
+
+            # Object result.
+            else:
+                prediction_dict = {
+                    key: value
+                    for key, value in vars(
+                        prediction
+                    ).items()
+                    if not key.startswith("_")
+                }
+
+        return (
+            prediction_dict,
+            None,
+        )
+
+    except Exception as exc:
+        return (
+            None,
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
+# ---------------------------------------------------------------------------
 # TEXT FORMATTING
 # ---------------------------------------------------------------------------
 
@@ -669,7 +1404,6 @@ def format_regional_distribution(
             "No regional HAP distribution available."
         ]
 
-    # Sort by number of grid points, largest first.
     ordered = sorted(
         distribution.items(),
         key=lambda item: item[1],
@@ -739,8 +1473,6 @@ def format_ionosphere(
             f"{name}: {condition}"
         )
 
-    # Only mention missing stations if there are no usable observations.
-    # Otherwise the Discord message can become unnecessarily large.
     if not usable:
 
         for observation in unusable:
@@ -779,7 +1511,6 @@ def format_space_weather(
     )
 
     if solar_flux is not None:
-
         lines.append(
             f"F10.7: {solar_flux}"
         )
@@ -789,7 +1520,6 @@ def format_space_weather(
     )
 
     if sunspots is not None:
-
         lines.append(
             f"Sunspots: {sunspots}"
         )
@@ -803,13 +1533,11 @@ def format_space_weather(
     )
 
     if australian_k is not None:
-
         lines.append(
             f"Australian K: {australian_k}"
         )
 
     elif planetary_k is not None:
-
         lines.append(
             f"Planetary K: {planetary_k}"
         )
@@ -819,7 +1547,6 @@ def format_space_weather(
     )
 
     if a_index is not None:
-
         lines.append(
             f"A-index: {a_index}"
         )
@@ -829,10 +1556,309 @@ def format_space_weather(
     )
 
     if dst is not None:
-
         lines.append(
             f"Dst: {dst}"
         )
+
+    # -----------------------------------------------------------------------
+    # T-index
+    # -----------------------------------------------------------------------
+
+    t_indices = weather.get(
+        "t_indices",
+        {},
+    )
+
+    if not isinstance(
+        t_indices,
+        dict,
+    ):
+        t_indices = {}
+
+    t_index_nz = weather.get(
+        "t_index_nz"
+    )
+
+    t_index_australia = weather.get(
+        "t_index_australia"
+    )
+
+    t_index_australian_region = weather.get(
+        "t_index_australian_region"
+    )
+
+    t_index_southern_australia = weather.get(
+        "t_index_southern_australia"
+    )
+
+    t_index_northern_australia = weather.get(
+        "t_index_northern_australia"
+    )
+
+    t_index_southern = weather.get(
+        "t_index_southern_hemisphere"
+    )
+
+    t_index_northern = weather.get(
+        "t_index_northern_hemisphere"
+    )
+
+    t_index_antarctic = weather.get(
+        "t_index_antarctic"
+    )
+
+    t_index = weather.get(
+        "t_index"
+    )
+
+    if t_index_nz is not None:
+        lines.append(
+            f"NZ T-index: {t_index_nz}"
+        )
+
+    if t_index_australian_region is not None:
+        lines.append(
+            f"Australian Region T-index: "
+            f"{t_index_australian_region}"
+        )
+
+    elif t_index_australia is not None:
+        lines.append(
+            f"Australian T-index: "
+            f"{t_index_australia}"
+        )
+
+    if t_index_southern_australia is not None:
+        lines.append(
+            f"Southern Australia T-index: "
+            f"{t_index_southern_australia}"
+        )
+
+    if t_index_northern_australia is not None:
+        lines.append(
+            f"Northern Australia T-index: "
+            f"{t_index_northern_australia}"
+        )
+
+    if t_index_southern is not None:
+        lines.append(
+            f"Southern Hemisphere T-index: "
+            f"{t_index_southern}"
+        )
+
+    if t_index_northern is not None:
+        lines.append(
+            f"Northern Hemisphere T-index: "
+            f"{t_index_northern}"
+        )
+
+    if t_index_antarctic is not None:
+        lines.append(
+            f"Antarctic T-index: "
+            f"{t_index_antarctic}"
+        )
+
+    # Generic fallback for compatibility.
+    if (
+        t_index is not None
+        and not any(
+            value is not None
+            for value in (
+                t_index_nz,
+                t_index_australia,
+                t_index_australian_region,
+                t_index_southern_australia,
+                t_index_northern_australia,
+                t_index_southern,
+                t_index_northern,
+                t_index_antarctic,
+            )
+        )
+    ):
+        lines.append(
+            f"T-index: {t_index}"
+        )
+
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# GRAFEX TEXT FORMATTING
+# ---------------------------------------------------------------------------
+
+def format_grafex_summary(
+    grafex: dict[str, Any],
+) -> list[str]:
+    """
+    Produce a concise human-readable summary of the GRAFEX prediction.
+
+    The complete structured GRAFEX data remains available in report.grafex.
+    """
+
+    lines = []
+
+    tx_name = grafex.get(
+        "tx_name"
+    )
+
+    rx_name = grafex.get(
+        "rx_name"
+    )
+
+    distance_km = grafex.get(
+        "distance_km"
+    )
+
+    prediction_date = grafex.get(
+        "prediction_date"
+    )
+
+    t_index = grafex.get(
+        "t_index"
+    )
+
+    if tx_name and rx_name:
+        lines.append(
+            f"Path: {tx_name} -> {rx_name}"
+        )
+
+    if distance_km is not None:
+        try:
+            lines.append(
+                f"Distance: {float(distance_km):.0f} km"
+            )
+        except (TypeError, ValueError):
+            lines.append(
+                f"Distance: {distance_km} km"
+            )
+
+    if prediction_date:
+        lines.append(
+            f"Prediction date: {prediction_date}"
+        )
+
+    if t_index is not None:
+        lines.append(
+            f"GRAFEX T-index: {t_index}"
+        )
+
+    bearing = grafex.get(
+        "bearing_tx_to_rx"
+    )
+
+    if bearing is not None:
+        try:
+            lines.append(
+                f"TX bearing: {float(bearing):.1f}°"
+            )
+        except (TypeError, ValueError):
+            pass
+
+    first_mode = grafex.get(
+        "first_mode"
+    )
+
+    second_mode = grafex.get(
+        "second_mode"
+    )
+
+    if first_mode or second_mode:
+
+        modes = [
+            mode
+            for mode in (
+                first_mode,
+                second_mode,
+            )
+            if mode
+        ]
+
+        lines.append(
+            "Propagation modes: "
+            + " / ".join(
+                str(mode)
+                for mode in modes
+            )
+        )
+
+    # -----------------------------------------------------------------------
+    # Hourly predictions
+    # -----------------------------------------------------------------------
+
+    hours = grafex.get(
+        "hours"
+    )
+
+    if isinstance(
+        hours,
+        list,
+    ) and hours:
+
+        lines.append("")
+        lines.append(
+            "GRAFEX hourly path prediction:"
+        )
+
+        shown = 0
+
+        for hour in hours:
+
+            if not isinstance(
+                hour,
+                dict,
+            ):
+                continue
+
+            utc_hour = hour.get(
+                "utc_hour"
+            )
+
+            frequencies = hour.get(
+                "frequencies",
+                {},
+            )
+
+            if not isinstance(
+                frequencies,
+                dict,
+            ):
+                continue
+
+            supported_bands = []
+
+            for band, prediction in frequencies.items():
+
+                if not isinstance(
+                    prediction,
+                    dict,
+                ):
+                    continue
+
+                if prediction.get(
+                    "supported"
+                ):
+                    supported_bands.append(
+                        str(band)
+                    )
+
+            if supported_bands:
+
+                try:
+                    hour_text = f"{int(utc_hour):02d}"
+                except (TypeError, ValueError):
+                    hour_text = str(utc_hour)
+
+                lines.append(
+                    f"  {hour_text} UTC: "
+                    + ", ".join(
+                        supported_bands
+                    )
+                )
+
+                shown += 1
+
+            if shown >= 24:
+                break
 
     return lines
 
@@ -857,9 +1883,15 @@ def extract_alert_message(
         "summary",
     ):
 
-        value = alert.get(key)
+        value = alert.get(
+            key
+        )
 
-        if isinstance(value, str) and value.strip():
+        if isinstance(
+            value,
+            str,
+        ) and value.strip():
+
             return value.strip()
 
     return ""
@@ -871,8 +1903,6 @@ def format_space_weather_alert(
     """
     Convert a raw space-weather alert dictionary into a concise
     human-readable summary.
-
-    The full alert remains available in SpaceWeatherData.raw.
     """
 
     message = extract_alert_message(
@@ -882,12 +1912,12 @@ def format_space_weather_alert(
     if not message:
         return "Space-weather alert"
 
-    # ------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Geomagnetic storm watch
-    # ------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     storm_match = re.search(
-        r"WATCH:\s*Geomagnetic Storm Category\s+"
+        r"WATCH:\s*\*+\s*Geomagnetic Storm Category\s+"
         r"(G\d+)\s+Predicted",
         message,
         flags=re.IGNORECASE,
@@ -895,21 +1925,18 @@ def format_space_weather_alert(
 
     if storm_match:
 
-        level = storm_match.group(1).upper()
-
-        # Look for a predicted date/level such as:
-        #
-        # Sep 24: G1 (Minor)
+        level = storm_match.group(
+            1
+        ).upper()
 
         date_match = re.search(
-            r"([A-Z][a-z]{2}\s+\d{1,2})\s*:\s*"
-            rf"{re.escape(level)}\s*\(",
+            r"([A-Z][a-z]{2}\s+\d{1,2})\s*:\s*\*?"
+            rf"{re.escape(level)}",
             message,
             flags=re.IGNORECASE,
         )
 
         if date_match:
-
             return (
                 f"{level} geomagnetic storm watch "
                 f"for {date_match.group(1)}"
@@ -919,12 +1946,12 @@ def format_space_weather_alert(
             f"{level} geomagnetic storm watch"
         )
 
-    # ------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Geomagnetic storm warning
-    # ------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     warning_match = re.search(
-        r"WARNING:\s*Geomagnetic Storm Category\s+"
+        r"WARNING:\s*\*+\s*Geomagnetic Storm Category\s+"
         r"(G\d+)",
         message,
         flags=re.IGNORECASE,
@@ -932,63 +1959,74 @@ def format_space_weather_alert(
 
     if warning_match:
 
-        level = warning_match.group(1).upper()
+        level = warning_match.group(
+            1
+        ).upper()
 
         return (
             f"{level} geomagnetic storm warning"
         )
 
-    # ------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Generic WATCH
-    # ------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     generic_watch = re.search(
-        r"WATCH:\s*(.+?)(?:\r?\n|$)",
+        r"WATCH:\s*\*+\s*(.+?)(?:\r?\n|$)",
         message,
         flags=re.IGNORECASE,
     )
 
     if generic_watch:
 
-        text = generic_watch.group(1).strip()
+        text = generic_watch.group(
+            1
+        ).strip(" *")
 
-        return text
+        if text:
+            return text
 
-    # ------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Generic WARNING
-    # ------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     generic_warning = re.search(
-        r"WARNING:\s*(.+?)(?:\r?\n|$)",
+        r"WARNING:\s*\*+\s*(.+?)(?:\r?\n|$)",
         message,
         flags=re.IGNORECASE,
     )
 
     if generic_warning:
 
-        text = generic_warning.group(1).strip()
+        text = generic_warning.group(
+            1
+        ).strip(" *")
 
-        return text
+        if text:
+            return text
 
-    # ------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Generic ALERT
-    # ------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     generic_alert = re.search(
-        r"ALERT:\s*(.+?)(?:\r?\n|$)",
+        r"ALERT:\s*\*+\s*(.+?)(?:\r?\n|$)",
         message,
         flags=re.IGNORECASE,
     )
 
     if generic_alert:
 
-        text = generic_alert.group(1).strip()
+        text = generic_alert.group(
+            1
+        ).strip(" *")
 
-        return text
+        if text:
+            return text
 
-    # ------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Fallback
-    # ------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
     first_line = (
         message.splitlines()[0].strip()
@@ -1024,8 +2062,13 @@ def format_space_weather_alerts(
             alert
         )
 
-        if text and text not in formatted:
-            formatted.append(text)
+        if (
+            text
+            and text not in formatted
+        ):
+            formatted.append(
+                text
+            )
 
     return formatted
 
@@ -1041,7 +2084,8 @@ def build_report_text(
     Create a compact human-readable report.
 
     This is deliberately plain text rather than Discord-specific Markdown.
-    Discord can use it directly now and format it further later.
+
+    GRAFEX is only displayed when a path was requested.
     """
 
     lines = []
@@ -1067,6 +2111,18 @@ def build_report_text(
         f"{report.latitude:.2f}, "
         f"{report.longitude:.2f}"
     )
+
+    # -----------------------------------------------------------------------
+    # Path
+    # -----------------------------------------------------------------------
+
+    if report.rx_location:
+
+        lines.append(
+            f"Path: "
+            f"{report.tx_location} -> "
+            f"{report.rx_location}"
+        )
 
     lines.append(
         f"Generated: {report.generated_local}"
@@ -1097,7 +2153,6 @@ def build_report_text(
             )
 
             if report.current_support is not None:
-
                 lines.append(
                     f"Grid support: "
                     f"{report.current_support}/49"
@@ -1120,7 +2175,7 @@ def build_report_text(
 
             lines.append(
                 f"Next transition: "
-                f"{report.next_transition_utc:02d} UTC → "
+                f"{report.next_transition_utc:02d} UTC -> "
                 f"{report.next_transition_band} "
                 f"({transition_frequency})"
             )
@@ -1153,6 +2208,47 @@ def build_report_text(
             )
 
     lines.append("")
+
+    # -----------------------------------------------------------------------
+    # GRAFEX
+    # -----------------------------------------------------------------------
+
+    if report.rx_location:
+
+        lines.append(
+            "GRAFEX PATH PREDICTION"
+        )
+
+        lines.append(
+            "-" * 60
+        )
+
+        if report.data_status.grafex_available:
+
+            if report.grafex:
+
+                for line in format_grafex_summary(
+                    report.grafex
+                ):
+
+                    lines.append(
+                        f"  {line}"
+                    )
+
+        else:
+
+            lines.append(
+                "  GRAFEX unavailable."
+            )
+
+            if report.data_status.grafex_error:
+
+                lines.append(
+                    f"  Reason: "
+                    f"{report.data_status.grafex_error}"
+                )
+
+        lines.append("")
 
     # -----------------------------------------------------------------------
     # IONOSPHERE
@@ -1205,7 +2301,6 @@ def build_report_text(
 
     if report.data_status.space_weather_available:
 
-        # Main measurements
         for line in format_space_weather(
             report.space_weather
         ):
@@ -1214,21 +2309,15 @@ def build_report_text(
                 f"  {line}"
             )
 
-        # Current NOAA/SWS alerts
         alerts = report.space_weather.get(
             "active_alerts",
             [],
         )
 
-        # Current warnings
         warnings = report.space_weather.get(
             "active_warnings",
             [],
         )
-
-        # ---------------------------------------------------------------
-        # Current watches / alerts
-        # ---------------------------------------------------------------
 
         formatted_alerts = (
             format_space_weather_alerts(
@@ -1249,10 +2338,6 @@ def build_report_text(
                 lines.append(
                     f"    • {alert_text}"
                 )
-
-        # ---------------------------------------------------------------
-        # Current warnings
-        # ---------------------------------------------------------------
 
         formatted_warnings = (
             format_space_weather_alerts(
@@ -1316,6 +2401,13 @@ def build_report_text(
         f"{'OK' if report.data_status.space_weather_available else 'FAILED'}"
     )
 
+    if report.rx_location:
+
+        lines.append(
+            f"  GRAFEX: "
+            f"{'OK' if report.data_status.grafex_available else 'FAILED'}"
+        )
+
     if report.space_weather.get(
         "retrieved_utc"
     ):
@@ -1323,6 +2415,15 @@ def build_report_text(
         lines.append(
             f"  Space weather retrieved: "
             f"{report.space_weather['retrieved_utc']}"
+        )
+
+    if report.space_weather.get(
+        "t_index_updated_utc"
+    ):
+
+        lines.append(
+            f"  SWS T-index updated: "
+            f"{report.space_weather['t_index_updated_utc']}"
         )
 
     lines.append("")
@@ -1372,9 +2473,9 @@ def build_report_text(
             )
 
         lines.append(
-            "  HAP is the primary propagation prediction; "
-            "space weather and ionospheric observations "
-            "provide supporting context."
+            "  HAP is the primary local/base-point "
+            "propagation prediction; space weather and "
+            "ionospheric observations provide supporting context."
         )
 
     else:
@@ -1383,6 +2484,39 @@ def build_report_text(
             "  There is not enough HAP data to provide "
             "a current band recommendation."
         )
+
+    # -----------------------------------------------------------------------
+    # Path-specific interpretation
+    # -----------------------------------------------------------------------
+
+    if report.rx_location:
+
+        lines.append("")
+
+        if report.data_status.grafex_available:
+
+            lines.append(
+                "  GRAFEX provides the path-specific "
+                "TX -> RX prediction for the requested route."
+            )
+
+            lines.append(
+                "  GRAFEX predictions should be treated as "
+                "model output rather than a guarantee that a "
+                "contact will succeed."
+            )
+
+        else:
+
+            lines.append(
+                "  A path-specific GRAFEX prediction was requested "
+                "but was not available."
+            )
+
+            lines.append(
+                "  The HAP, ionosphere, and space-weather data above "
+                "remain available as supporting information."
+            )
 
     lines.append("")
 
@@ -1399,22 +2533,71 @@ def build_report_text(
 # MAIN REPORT GENERATOR
 # ---------------------------------------------------------------------------
 
-def get_propagation_report() -> PropagationReport:
+def get_propagation_report(
+    tx_location: str = LOCATION_NAME,
+    rx_location: Optional[str] = None,
+) -> PropagationReport:
     """
     Collect all propagation information and return a complete report.
 
-    This is the main function that discord_bot.py should call.
-
-    Example:
-
-        from main import get_propagation_report
+    NORMAL REPORT
+    -------------
 
         report = get_propagation_report()
 
-        print(report.text)
+    This produces the normal Nelson/base-point report.
 
-    The function attempts to keep working even if one data source fails.
+    PATH-SPECIFIC REPORT
+    --------------------
+
+        report = get_propagation_report(
+            tx_location="Nelson, New Zealand",
+            rx_location="Sydney, Australia",
+        )
+
+    This produces:
+
+        - HAP centred on the TX location
+        - ionospheric observations
+        - space weather
+        - SWS T-index selection
+        - GRAFEX TX -> RX prediction
+
+    GRAFEX is optional.
+
+    If rx_location is omitted, no GRAFEX request is made.
+
+    If rx_location is supplied but GRAFEX fails, the rest of the report
+    remains available.
     """
+
+    # -----------------------------------------------------------------------
+    # NORMALISE INPUT
+    # -----------------------------------------------------------------------
+
+    if isinstance(
+        tx_location,
+        str,
+    ):
+        tx_location = tx_location.strip()
+    else:
+        tx_location = LOCATION_NAME
+
+    if not tx_location:
+        tx_location = LOCATION_NAME
+
+    if isinstance(
+        rx_location,
+        str,
+    ):
+
+        rx_location = rx_location.strip()
+
+        if not rx_location:
+            rx_location = None
+
+    else:
+        rx_location = None
 
     # -----------------------------------------------------------------------
     # TIME
@@ -1435,6 +2618,46 @@ def get_propagation_report() -> PropagationReport:
     )
 
     # -----------------------------------------------------------------------
+    # RESOLVE TRANSMITTER LOCATION
+    # -----------------------------------------------------------------------
+
+    resolved_tx_name = tx_location
+
+    tx_latitude = LOCATION_LATITUDE
+    tx_longitude = LOCATION_LONGITUDE
+
+    try:
+
+        (
+            resolved_tx_name,
+            tx_latitude,
+            tx_longitude,
+        ) = resolve_location(
+            tx_location
+        )
+
+    except Exception:
+
+        # Preserve the configured Nelson fallback if Nelson was requested.
+        #
+        # For arbitrary locations, GRAFEX independently performs its own
+        # path/location handling. HAP falls back to Nelson if the TX
+        # location cannot be resolved.
+
+        if (
+            tx_location.casefold()
+            not in {
+                LOCATION_NAME.casefold(),
+                "nelson, new zealand",
+            }
+        ):
+
+            resolved_tx_name = tx_location
+
+            tx_latitude = LOCATION_LATITUDE
+            tx_longitude = LOCATION_LONGITUDE
+
+    # -----------------------------------------------------------------------
     # STATUS
     # -----------------------------------------------------------------------
 
@@ -1443,6 +2666,8 @@ def get_propagation_report() -> PropagationReport:
     # -----------------------------------------------------------------------
     # SPACE WEATHER
     # -----------------------------------------------------------------------
+
+    weather = None
 
     try:
 
@@ -1457,8 +2682,6 @@ def get_propagation_report() -> PropagationReport:
         )
 
     except Exception as exc:
-
-        weather = None
 
         space_weather = {}
 
@@ -1488,8 +2711,6 @@ def get_propagation_report() -> PropagationReport:
 
     except Exception as exc:
 
-        ionosphere_raw = {}
-
         ionosphere_observations = []
 
         status.ionosphere_available = False
@@ -1503,25 +2724,25 @@ def get_propagation_report() -> PropagationReport:
     # -----------------------------------------------------------------------
 
     current_band = None
-
     current_frequency_mhz = None
-
     current_support = None
 
     next_transition_utc = None
-
     next_transition_band = None
-
     next_transition_frequency_mhz = None
 
     regional_distribution = {}
 
     try:
 
-        config, decoded_hap = (
-            collect_hap(
-                current_time
-            )
+        (
+            config,
+            decoded_hap,
+        ) = collect_hap(
+            current_time=current_time,
+            location_name=resolved_tx_name,
+            latitude=tx_latitude,
+            longitude=tx_longitude,
         )
 
         status.hap_available = True
@@ -1555,7 +2776,6 @@ def get_propagation_report() -> PropagationReport:
             )
         )
 
-        # Look for the next change in the base-point recommendation.
         (
             next_transition_utc,
             next_transition_band,
@@ -1575,32 +2795,76 @@ def get_propagation_report() -> PropagationReport:
         )
 
     # -----------------------------------------------------------------------
+    # GRAFEX
+    # -----------------------------------------------------------------------
+
+    grafex = None
+
+    if rx_location is not None:
+
+        # Select a direct SWS T-index for the requested path.
+        #
+        # This is deliberately done only after space_weather.py has
+        # provided its live T-index dictionary.
+        t_index = extract_grafex_t_index(
+            tx_location=tx_location,
+            rx_location=rx_location,
+            weather=weather,
+            weather_report=space_weather,
+        )
+
+        prediction_date = (
+            current_time.date()
+        )
+
+        (
+            grafex,
+            grafex_error,
+        ) = run_grafex_path_prediction(
+            tx_location=tx_location,
+            rx_location=rx_location,
+            prediction_date=prediction_date,
+            t_index=t_index,
+        )
+
+        if grafex is not None:
+
+            status.grafex_available = True
+
+        else:
+
+            status.grafex_available = False
+
+            status.grafex_error = (
+                grafex_error
+            )
+
+    # -----------------------------------------------------------------------
     # BUILD REPORT
     # -----------------------------------------------------------------------
 
     report = PropagationReport(
-        location_name=LOCATION_NAME,
+        # TX/base point
+        location_name=resolved_tx_name,
+        latitude=tx_latitude,
+        longitude=tx_longitude,
 
-        latitude=LOCATION_LATITUDE,
+        # Path
+        tx_location=tx_location,
+        rx_location=rx_location,
 
-        longitude=LOCATION_LONGITUDE,
-
+        # Timing
         generated_utc=generated_utc,
-
         generated_local=generated_local,
-
         current_utc_hour=current_hour,
 
+        # HAP
         current_band=current_band,
-
         current_frequency_mhz=current_frequency_mhz,
-
         current_support=current_support,
 
         next_transition_utc=next_transition_utc,
-
         next_transition_band=next_transition_band,
-
         next_transition_frequency_mhz=(
             next_transition_frequency_mhz
         ),
@@ -1609,21 +2873,25 @@ def get_propagation_report() -> PropagationReport:
             regional_distribution
         ),
 
+        # Supporting data
         ionosphere_observations=(
             ionosphere_observations
         ),
 
         space_weather=space_weather,
 
+        # GRAFEX
+        grafex=grafex,
+
+        # Status
         data_status=status,
 
+        # Filled immediately below
         text="",
     )
 
     # Generate the human-readable representation after the complete
-    # report exists. This means Discord can use either report.text or
-    # the individual structured fields.
-
+    # report exists.
     report.text = build_report_text(
         report
     )
@@ -1639,8 +2907,14 @@ def main() -> None:
     """
     Command-line entry point.
 
-    This is only for testing/development. The Discord bot should normally
-    call get_propagation_report() directly.
+    By default this tests the normal non-GRAFEX report.
+
+    To test a path-specific report, change the call to:
+
+        get_propagation_report(
+            tx_location="Nelson, New Zealand",
+            rx_location="Sydney, Australia",
+        )
     """
 
     report = get_propagation_report()

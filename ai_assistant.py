@@ -20,20 +20,21 @@ from main import get_propagation_report
 load_dotenv()
 
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
-#MISTRAL_MODEL=ministral-14b-2512
 
 # Can be overridden in .env
-MISTRAL_MODEL = os.getenv("MISTRAL_MODEL",)
-   
+MISTRAL_MODEL = os.getenv(
+    "MISTRAL_MODEL",
+    "ministral-14b-2512",
+)
 
 # Maximum number of model -> tool -> model cycles
 MAX_TOOL_ROUNDS = 5
 
-# Keep the conversational history deliberately short.
+# Keep conversational history deliberately short.
 # Tool data is NOT retained indefinitely.
 MAX_HISTORY_MESSAGES = 6
 
-# Cache the propagation engine for a few minutes.
+# Cache propagation reports for a few minutes.
 REPORT_CACHE_SECONDS = 300
 
 
@@ -56,34 +57,93 @@ client = Mistral(
 # PROPAGATION REPORT CACHE
 # ============================================================
 
-_cached_report: Any | None = None
-_cached_report_time: float = 0.0
+# Cache is keyed by TX/RX path.
+#
+# This is important because:
+#
+# Nelson -> Sydney
+#
+# and
+#
+# Nelson -> Tokyo
+#
+# must never accidentally return the same cached GRAFEX result.
+
+_cached_reports: dict[
+    tuple[str | None, str | None],
+    tuple[Any, float],
+] = {}
 
 
-def get_cached_propagation_report() -> Any:
+def get_cached_propagation_report(
+    tx_location: str | None = None,
+    rx_location: str | None = None,
+) -> Any:
     """
-    Return a cached propagation report.
+    Return a cached propagation report for the requested path.
 
-    The propagation engine itself remains the source of truth.
-    This cache simply prevents repeated expensive HAP /
-    ionosphere / space-weather requests during one conversation.
+    The propagation engine remains the source of truth.
+
+    The cache simply prevents repeated expensive HAP /
+    ionosphere / space-weather / GRAFEX requests for the
+    same path within the cache period.
     """
 
-    global _cached_report
-    global _cached_report_time
+    global _cached_reports
+
+    # Normalize locations for consistent cache keys.
+    tx_key = (
+        tx_location.strip()
+        if isinstance(tx_location, str) and tx_location.strip()
+        else None
+    )
+
+    rx_key = (
+        rx_location.strip()
+        if isinstance(rx_location, str) and rx_location.strip()
+        else None
+    )
+
+    cache_key = (
+        tx_key,
+        rx_key,
+    )
 
     now = time.time()
 
-    if (
-        _cached_report is not None
-        and now - _cached_report_time < REPORT_CACHE_SECONDS
-    ):
-        return _cached_report
+    cached = _cached_reports.get(
+        cache_key
+    )
 
-    report = get_propagation_report()
+    if cached is not None:
+        cached_report, cached_time = cached
 
-    _cached_report = report
-    _cached_report_time = now
+        if now - cached_time < REPORT_CACHE_SECONDS:
+            return cached_report
+
+        # Remove expired entry.
+        _cached_reports.pop(
+            cache_key,
+            None,
+        )
+
+    # --------------------------------------------------------
+    # Call the actual propagation engine.
+    #
+    # For path-specific requests this passes TX/RX through to
+    # main.py, where GRAFEX should perform the point-to-point
+    # calculation.
+    # --------------------------------------------------------
+
+    report = get_propagation_report(
+        tx_location=tx_key,
+        rx_location=rx_key,
+    )
+
+    _cached_reports[cache_key] = (
+        report,
+        now,
+    )
 
     return report
 
@@ -108,7 +168,9 @@ def serialize_value(value: Any) -> Any:
         return value.isoformat()
 
     if is_dataclass(value):
-        return serialize_value(asdict(value))
+        return serialize_value(
+            asdict(value)
+        )
 
     if isinstance(value, dict):
         return {
@@ -134,13 +196,17 @@ def serialize_value(value: Any) -> Any:
     # Try common object serialization methods.
     if hasattr(value, "model_dump"):
         try:
-            return serialize_value(value.model_dump())
+            return serialize_value(
+                value.model_dump()
+            )
         except Exception:
             pass
 
     if hasattr(value, "dict"):
         try:
-            return serialize_value(value.dict())
+            return serialize_value(
+                value.dict()
+            )
         except Exception:
             pass
 
@@ -180,7 +246,10 @@ def get_report_value(
         return default
 
     if isinstance(report, dict):
-        return report.get(key, default)
+        return report.get(
+            key,
+            default,
+        )
 
     return getattr(
         report,
@@ -189,13 +258,17 @@ def get_report_value(
     )
 
 
-def report_to_dict(report: Any) -> dict[str, Any]:
+def report_to_dict(
+    report: Any,
+) -> dict[str, Any]:
     """
     Convert the propagation report into a dictionary.
 
     Human-readable 'text' is deliberately removed because the AI
     should reason from structured data rather than from pre-written
     interpretations.
+
+    The GRAFEX result is NOT removed.
     """
 
     if report is None:
@@ -217,44 +290,132 @@ def report_to_dict(report: Any) -> dict[str, Any]:
         return {}
 
     # Never feed the human-readable report back into the AI.
-    data.pop("text", None)
+    #
+    # IMPORTANT:
+    # Do NOT remove "grafex".
+    # Do NOT remove "space_weather".
+    # Do NOT remove "hap".
+    # Do NOT remove "ionosphere".
+    data.pop(
+        "text",
+        None,
+    )
 
-    return serialize_value(data)
+    return serialize_value(
+        data
+    )
 
 
 # ============================================================
 # AI TOOL: FULL STRUCTURED PROPAGATION REPORT
 # ============================================================
 
-def tool_get_propagation_report() -> dict[str, Any]:
+def tool_get_propagation_report(
+    tx_location: str | None = None,
+    rx_location: str | None = None,
+) -> dict[str, Any]:
     """
     Return structured propagation data for the AI.
 
-    The human-readable report is deliberately excluded.
+    For path-specific questions, TX and RX locations are passed
+    into the propagation engine so that GRAFEX can perform the
+    actual point-to-point prediction.
+
+    For general propagation questions, locations may be omitted.
     """
 
     try:
-        report = get_cached_propagation_report()
+        # ----------------------------------------------------
+        # Validate paired locations.
+        # ----------------------------------------------------
+
+        if (
+            tx_location is not None
+            and not isinstance(tx_location, str)
+        ):
+            return {
+                "type": "propagation_report",
+                "status": "error",
+                "error": (
+                    "tx_location must be a string."
+                ),
+            }
+
+        if (
+            rx_location is not None
+            and not isinstance(rx_location, str)
+        ):
+            return {
+                "type": "propagation_report",
+                "status": "error",
+                "error": (
+                    "rx_location must be a string."
+                ),
+            }
+
+        tx_location = (
+            tx_location.strip()
+            if tx_location
+            else None
+        )
+
+        rx_location = (
+            rx_location.strip()
+            if rx_location
+            else None
+        )
+
+        # A path-specific report requires both endpoints.
+        if (
+            (tx_location is None)
+            != (rx_location is None)
+        ):
+            return {
+                "type": "propagation_report",
+                "status": "error",
+                "error": (
+                    "Path-specific propagation requires both "
+                    "tx_location and rx_location."
+                ),
+            }
+
+        # ----------------------------------------------------
+        # Get the actual propagation report.
+        # ----------------------------------------------------
+
+        report = get_cached_propagation_report(
+            tx_location=tx_location,
+            rx_location=rx_location,
+        )
 
         if report is None:
             return {
                 "type": "propagation_report",
                 "status": "unavailable",
-                "error": "Propagation report is unavailable.",
+                "error": (
+                    "Propagation report is unavailable."
+                ),
             }
 
-        data = report_to_dict(report)
+        data = report_to_dict(
+            report
+        )
 
         if not data:
             return {
                 "type": "propagation_report",
                 "status": "error",
-                "error": "Propagation report contained no usable data.",
+                "error": (
+                    "Propagation report contained "
+                    "no usable data."
+                ),
             }
 
         return {
             "type": "propagation_report",
             "status": "ok",
+            "tx_location": tx_location,
+            "rx_location": rx_location,
             "data": data,
         }
 
@@ -270,13 +431,22 @@ def tool_get_propagation_report() -> dict[str, Any]:
 # AI TOOL: HAP
 # ============================================================
 
-def tool_get_hap_forecast() -> dict[str, Any]:
+def tool_get_hap_forecast(
+    tx_location: str | None = None,
+    rx_location: str | None = None,
+) -> dict[str, Any]:
     """
     Return only the HAP portion of the propagation report.
+
+    If TX/RX locations are supplied, the underlying report is
+    generated for that path.
     """
 
     try:
-        report = get_cached_propagation_report()
+        report = get_cached_propagation_report(
+            tx_location=tx_location,
+            rx_location=rx_location,
+        )
 
         hap = get_report_value(
             report,
@@ -287,13 +457,19 @@ def tool_get_hap_forecast() -> dict[str, Any]:
             return {
                 "type": "hap_forecast",
                 "status": "unavailable",
-                "error": "HAP data is unavailable.",
+                "error": (
+                    "HAP data is unavailable."
+                ),
             }
 
         return {
             "type": "hap_forecast",
             "status": "ok",
-            "data": serialize_value(hap),
+            "tx_location": tx_location,
+            "rx_location": rx_location,
+            "data": serialize_value(
+                hap
+            ),
         }
 
     except Exception as exc:
@@ -308,13 +484,22 @@ def tool_get_hap_forecast() -> dict[str, Any]:
 # AI TOOL: IONOSPHERE
 # ============================================================
 
-def tool_get_ionosphere() -> dict[str, Any]:
+def tool_get_ionosphere(
+    tx_location: str | None = None,
+    rx_location: str | None = None,
+) -> dict[str, Any]:
     """
     Return only ionospheric observations.
+
+    If TX/RX locations are supplied, the underlying report is
+    generated for that path.
     """
 
     try:
-        report = get_cached_propagation_report()
+        report = get_cached_propagation_report(
+            tx_location=tx_location,
+            rx_location=rx_location,
+        )
 
         ionosphere = get_report_value(
             report,
@@ -325,13 +510,19 @@ def tool_get_ionosphere() -> dict[str, Any]:
             return {
                 "type": "ionosphere",
                 "status": "unavailable",
-                "error": "Ionospheric data is unavailable.",
+                "error": (
+                    "Ionospheric data is unavailable."
+                ),
             }
 
         return {
             "type": "ionosphere",
             "status": "ok",
-            "data": serialize_value(ionosphere),
+            "tx_location": tx_location,
+            "rx_location": rx_location,
+            "data": serialize_value(
+                ionosphere
+            ),
         }
 
     except Exception as exc:
@@ -346,13 +537,23 @@ def tool_get_ionosphere() -> dict[str, Any]:
 # AI TOOL: SPACE WEATHER
 # ============================================================
 
-def tool_get_space_weather() -> dict[str, Any]:
+def tool_get_space_weather(
+    tx_location: str | None = None,
+    rx_location: str | None = None,
+) -> dict[str, Any]:
     """
-    Return only current space-weather measurements and alerts.
+    Return current space-weather measurements and alerts.
+
+    If TX/RX locations are supplied, the underlying report is
+    generated for that path so the associated T-index/GRAFEX
+    information remains consistent with the requested report.
     """
 
     try:
-        report = get_cached_propagation_report()
+        report = get_cached_propagation_report(
+            tx_location=tx_location,
+            rx_location=rx_location,
+        )
 
         space_weather = get_report_value(
             report,
@@ -363,13 +564,19 @@ def tool_get_space_weather() -> dict[str, Any]:
             return {
                 "type": "space_weather",
                 "status": "unavailable",
-                "error": "Space-weather data is unavailable.",
+                "error": (
+                    "Space-weather data is unavailable."
+                ),
             }
 
         return {
             "type": "space_weather",
             "status": "ok",
-            "data": serialize_value(space_weather),
+            "tx_location": tx_location,
+            "rx_location": rx_location,
+            "data": serialize_value(
+                space_weather
+            ),
         }
 
     except Exception as exc:
@@ -390,15 +597,52 @@ TOOLS = [
         "function": {
             "name": "get_propagation_report",
             "description": (
-                "Get the current structured HF propagation report "
-                "for the configured location. This includes HAP, "
-                "ionosphere and space-weather data. Use this when "
-                "the user asks for a broad current propagation "
-                "overview."
+                "Get the current structured HF propagation report. "
+                "This includes HAP, ionosphere, space weather, "
+                "and path-specific GRAFEX data when TX and RX "
+                "locations are supplied. "
+                "\n\n"
+                "IMPORTANT: If the user asks about propagation "
+                "between two locations, you MUST provide both "
+                "tx_location and rx_location. "
+                "The propagation engine will use those locations "
+                "to run the actual point-to-point GRAFEX prediction. "
+                "\n\n"
+                "Examples of path-specific questions include: "
+                "'How do I reach Sydney from Nelson?', "
+                "'What bands could I use from Nelson to Sydney?', "
+                "'What does GRAFEX predict for Nelson to Sydney?', "
+                "or 'What is the propagation between New Zealand "
+                "and Australia?'. "
+                "\n\n"
+                "For a general current propagation overview where "
+                "no specific path is mentioned, locations may be "
+                "omitted."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "tx_location": {
+                        "type": "string",
+                        "description": (
+                            "Transmitter location. "
+                            "Use a clear location such as "
+                            "'Nelson, New Zealand'. "
+                            "Required for a path-specific "
+                            "propagation prediction."
+                        ),
+                    },
+                    "rx_location": {
+                        "type": "string",
+                        "description": (
+                            "Receiver location. "
+                            "Use a clear location such as "
+                            "'Sydney, Australia'. "
+                            "Required for a path-specific "
+                            "propagation prediction."
+                        ),
+                    },
+                },
                 "required": [],
             },
         },
@@ -409,13 +653,30 @@ TOOLS = [
             "name": "get_hap_forecast",
             "description": (
                 "Get the current HAP HF propagation forecast. "
-                "Use this for questions about which bands HAP "
-                "currently predicts, upcoming HAP transitions, "
-                "regional HAP distribution, or band conditions."
+                "Use this for questions about HAP predictions, "
+                "band predictions, upcoming HAP transitions, "
+                "or regional HAP distribution. "
+                "If the user specifies a TX/RX path, provide "
+                "both locations."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "tx_location": {
+                        "type": "string",
+                        "description": (
+                            "Transmitter location if a specific "
+                            "path is being requested."
+                        ),
+                    },
+                    "rx_location": {
+                        "type": "string",
+                        "description": (
+                            "Receiver location if a specific "
+                            "path is being requested."
+                        ),
+                    },
+                },
                 "required": [],
             },
         },
@@ -428,11 +689,28 @@ TOOLS = [
                 "Get current ionospheric station observations. "
                 "Use this when the user asks about MUF observations, "
                 "ionospheric enhancement/depression, or current "
-                "station-level ionospheric conditions."
+                "station-level ionospheric conditions. "
+                "If the question is specifically about a path, "
+                "provide TX and RX locations when available."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "tx_location": {
+                        "type": "string",
+                        "description": (
+                            "Transmitter location if relevant "
+                            "to the requested propagation path."
+                        ),
+                    },
+                    "rx_location": {
+                        "type": "string",
+                        "description": (
+                            "Receiver location if relevant "
+                            "to the requested propagation path."
+                        ),
+                    },
+                },
                 "required": [],
             },
         },
@@ -443,13 +721,31 @@ TOOLS = [
             "name": "get_space_weather",
             "description": (
                 "Get current solar and geomagnetic measurements "
-                "and current space-weather alerts. Use this for "
-                "questions specifically about solar or geomagnetic "
-                "weather."
+                "and current space-weather alerts. "
+                "Use this for questions specifically about solar "
+                "or geomagnetic weather. "
+                "If the user asks for space weather in the context "
+                "of a specific propagation path, provide TX/RX "
+                "locations when available."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "tx_location": {
+                        "type": "string",
+                        "description": (
+                            "Transmitter location if relevant "
+                            "to the requested propagation path."
+                        ),
+                    },
+                    "rx_location": {
+                        "type": "string",
+                        "description": (
+                            "Receiver location if relevant "
+                            "to the requested propagation path."
+                        ),
+                    },
+                },
                 "required": [],
             },
         },
@@ -458,10 +754,17 @@ TOOLS = [
 
 
 AVAILABLE_TOOLS = {
-    "get_propagation_report": tool_get_propagation_report,
-    "get_hap_forecast": tool_get_hap_forecast,
-    "get_ionosphere": tool_get_ionosphere,
-    "get_space_weather": tool_get_space_weather,
+    "get_propagation_report":
+        tool_get_propagation_report,
+
+    "get_hap_forecast":
+        tool_get_hap_forecast,
+
+    "get_ionosphere":
+        tool_get_ionosphere,
+
+    "get_space_weather":
+        tool_get_space_weather,
 }
 
 
@@ -469,362 +772,261 @@ AVAILABLE_TOOLS = {
 # SYSTEM PROMPT
 # ============================================================
 
-
 SYSTEM_PROMPT = """
-You are RadioPathwayTool, an HF radio propagation assistant.
+You are RadioPathwayTool, an HF amateur-radio propagation assistant.
 
-Your job is to explain HF propagation using the actual data
-returned by the RadioPathwayTool Python tools.
+Your purpose is to answer questions about HF propagation using the actual data returned by the RadioPathwayTool Python tools.
 
-The Python propagation engine is the source of truth.
+The Python tools and propagation engine are the source of truth for current conditions and model predictions.
 
-You may explain scientific concepts and interpret measurements,
-but you must never invent measurements, forecasts, path results,
-frequencies, times, alerts, or propagation effects.
+Never invent measurements, forecasts, path results, frequencies, times, alerts, propagation effects, or other data.
 
 ============================================================
-CORE PRINCIPLE: EVIDENCE CHAIN
-============================================================
 
-Every factual claim about current conditions must be traceable
-to supplied data.
+1. CORE RULE
+   ============================================================
 
-Use this reasoning chain:
+Use this evidence chain:
 
-MEASURED / MODEL DATA
-        ↓
-DIRECT SCIENTIFIC INTERPRETATION
-        ↓
-STOP
+DATA → DIRECT INTERPRETATION → ANSWER
 
-Do NOT continue from a direct interpretation into an unsupported
-second-order conclusion.
+Do not make unsupported additional inferences.
 
-Example:
+For example:
 
 GOOD:
-"K-index is 0.67. This is consistent with relatively quiet
+"K-index is 0.67. That is consistent with relatively quiet
 geomagnetic activity."
-
-BAD:
-"K-index is 0.67, therefore the ionosphere is stable."
 
 BAD:
 "K-index is 0.67, therefore HF propagation is stable."
 
 BAD:
-"K-index is 0.67, therefore 80m should work well."
+"K-index is 0.67, therefore 80m will work."
 
-The first statement is a direct interpretation.
+A measurement may support a scientific interpretation, but it does
+not automatically support a prediction about a particular band or
+path.
 
-The others make additional claims that the supplied measurement
-does not establish.
-
-============================================================
-DATA VS INTERPRETATION
-============================================================
-
-Always distinguish between:
-
-1. What the source measured or predicted.
-2. What that measurement directly indicates.
-3. What cannot be concluded from it.
-
-Preferred wording:
-
-"F10.7 is 106 sfu. This is the measured solar radio flux."
-
-"Planetary K-index is 0.67. This is consistent with relatively
-quiet geomagnetic activity."
-
-"HAP predicts 80m at the current base point."
-
-"Ionospheric observations show Perth at +23% relative to normal."
-
-Then explicitly stop unless another supplied dataset supports
-the next conclusion.
-
-Do not turn several individually reasonable observations into
-a broader conclusion unless that broader conclusion is directly
-supported.
+When several datasets are available, do not combine them into a
+stronger conclusion unless the supplied data explicitly supports
+that conclusion.
 
 ============================================================
-TOOL SELECTION
-============================================================
+2. RESPONSE STYLE
+=================
 
-Use the appropriate tool whenever the user asks about current
-data.
+Be concise and directly answer the user's question.
+
+Default response length:
+
+* Simple question: 1–3 sentences.
+* Simple recommendation: 2–5 sentences or a few bullets.
+* Broader technical question: short headings and concise bullets.
+* Detailed analysis: only when the user asks for detail.
+
+Do not dump the entire propagation report.
+
+Do not repeat raw tool output unnecessarily.
+
+Only mention data that is relevant to the question.
+
+Answer the question first, then provide the minimum explanation
+needed to understand the answer.
+
+If the user asks a simple question, give a simple answer.
+
+============================================================
+3. TOOL SELECTION
+=================
+
+Use the appropriate tool when current information is required.
 
 Use get_space_weather for:
 
-- F10.7
-- sunspot number
-- planetary K-index
-- Australian K-index
-- A-index
-- Dst
-- X-ray flux
-- HF fadeout
-- polar-cap absorption
-- current alerts
-- current warnings
-- current watches
+* F10.7
+* sunspot number
+* planetary K-index
+* Australian K-index
+* A-index
+* Dst
+* X-ray flux
+* HF fadeout
+* polar-cap absorption
+* current alerts
+* current warnings
+* current watches
 
 Use get_ionosphere for:
 
-- current ionospheric observations
-- station MUF observations
-- enhancement/depression
-- station-level ionospheric conditions
+* current ionospheric observations
+* station MUF observations
+* station enhancement/depression
+* station-level ionospheric conditions
 
 Use get_hap_forecast for:
 
-- current HAP band prediction
-- upcoming HAP transitions
-- regional HAP distribution
-- questions such as "will 80m work tonight?"
-- questions about which bands HAP currently predicts
+* HAP predictions
+* current HAP band predictions
+* upcoming HAP transitions
+* HAP regional distributions
 
 Use get_propagation_report for:
 
-- broad current propagation questions
-- questions involving multiple datasets
-- general "what are conditions like?" questions
+* broad current propagation questions
+* questions involving multiple propagation datasets
+* path-specific questions
+* questions involving GRAFEX
+* questions asking about propagation between two locations
 
-If the user asks for a specific category of current information,
-prefer the specialized tool rather than requesting the entire
-propagation report.
-
-============================================================
-SPACE WEATHER
-============================================================
-
-F10.7:
-
-F10.7 measures solar radio flux.
-
-Allowed:
-"F10.7 is 106 sfu."
-
-Allowed:
-"That is the measured solar radio flux."
-
-Not allowed:
-"F10.7 is 106 sfu, therefore HF propagation is good."
-
-Not allowed:
-"F10.7 is 106 sfu, therefore 20m is open."
-
-F10.7 alone does not determine current HF propagation.
-
-------------------------------------------------------------
-
-SUNSPOT NUMBER:
-
-Sunspot number describes observed sunspot activity.
-
-Allowed:
-"Sunspot number is 76."
-
-Allowed:
-"Sunspot number is a measure of sunspot activity."
-
-Not allowed:
-"Sunspot number of 76 means 20m should be good."
-
-Not allowed:
-"Sunspot number of 76 means the ionosphere is strong."
-
-Do not use sunspot number alone to determine current band
-suitability.
-
-------------------------------------------------------------
-
-PLANETARY K-INDEX:
-
-K-index describes geomagnetic activity.
-
-Allowed:
-"K-index is 0.67, which is consistent with relatively quiet
-geomagnetic activity."
-
-Not allowed:
-"K-index is 0.67, therefore HF propagation is stable."
-
-Not allowed:
-"K-index is 0.67, therefore the ionosphere is undisturbed."
-
-Not allowed:
-"K-index is 0.67, therefore 80m will work."
-
-------------------------------------------------------------
-
-DST:
-
-Dst is an indicator of geomagnetic disturbance associated with
-the magnetospheric ring current.
-
-Allowed:
-"Dst is +29 nT."
-
-Allowed:
-"The positive Dst value does not indicate a strong negative
-ring-current disturbance."
-
-Do not turn Dst alone into a prediction of HF performance.
-
-------------------------------------------------------------
-
-X-RAY FLUX:
-
-X-ray flux may provide information about solar X-ray activity.
-
-If X-ray data is unavailable:
-
-GOOD:
-"X-ray flux is unavailable."
-
-GOOD:
-"Current X-ray activity cannot be assessed from the supplied
-X-ray data."
-
-BAD:
-"There are no solar flares."
-
-BAD:
-"No recent flare activity is occurring."
-
-BAD:
-"The Sun is not producing X-ray flares."
-
-Missing X-ray data is NEVER evidence that no flare is occurring.
-
-------------------------------------------------------------
-
-HF FADEOUT:
-
-If HF fadeout is False:
-
-Allowed:
-"No HF fadeout event is currently reported by the supplied data."
-
-Not allowed:
-"HF propagation is unaffected."
-
-Not allowed:
-"Your HF signals will not be affected."
-
-Not allowed:
-"The ionosphere is stable."
-
-A lack of a reported fadeout does not establish that all HF
-propagation is unaffected.
-
-------------------------------------------------------------
-
-POLAR-CAP ABSORPTION:
-
-If PCA is False:
-
-Allowed:
-"No polar-cap absorption event is currently reported."
-
-Not allowed:
-"The polar ionosphere is undisturbed."
-
-Not allowed:
-"HF propagation will be unaffected."
-
-Not allowed:
-"There is no ionospheric absorption."
+For path-specific questions, get_propagation_report is the primary
+tool.
 
 ============================================================
-IMPORTANT: DO NOT COMBINE ABSENCES
-============================================================
+4. PATH-SPECIFIC QUESTIONS
+==========================
 
-Do not combine several "false", "none", or "unavailable" fields
-into a broader conclusion.
+When the user asks about propagation between two locations:
 
-For example, if:
+1. Identify the transmitter location (TX).
+2. Identify the receiver location (RX).
+3. Call get_propagation_report with BOTH locations.
+4. Use the returned GRAFEX result when available.
 
-- HF fadeout = False
-- PCA = False
-- alerts = none
-- K-index is low
+Example:
 
-DO NOT conclude:
+"What is the best way to reach Sydney from Nelson?"
 
-"The ionosphere is stable."
+Call:
 
-DO NOT conclude:
+get_propagation_report(
+tx_location="Nelson, New Zealand",
+rx_location="Sydney, Australia"
+)
 
-"There is minimal ionospheric disruption."
+Example:
 
-DO NOT conclude:
+"What does propagation look like from Blenheim to Brisbane?"
 
-"HF propagation should be stable."
+Call:
 
-Instead report the individual observations and explain only what
-each observation directly supports.
+get_propagation_report(
+tx_location="Blenheim, New Zealand",
+rx_location="Brisbane, Australia"
+)
 
-============================================================
-IONOSPHERIC OBSERVATIONS
-============================================================
+Do NOT call the zero-location version for a path-specific question.
 
-Ionospheric observations are station-specific.
+Do not substitute regional HAP information for a path-specific
+GRAFEX result.
 
-If Perth reports +23%:
-
-GOOD:
-"Perth is reporting an ionospheric value 23% above normal."
-
-GOOD:
-"Perth is currently showing enhanced conditions relative to its
-normal reference."
-
-BAD:
-"Propagation from Nelson to Perth should be stronger."
-
-BAD:
-"Australia has enhanced ionospheric conditions."
-
-BAD:
-"Long-distance propagation from Nelson should be better."
-
-If Mawson reports +17%:
-
-GOOD:
-"Mawson is reporting enhanced conditions."
-
-BAD:
-"The Nelson-to-Antarctica path is enhanced."
-
-A station observation does not automatically describe:
-
-- the user's exact location
-- the user's exact path
-- an entire country
-- an entire region
-- an entire hemisphere
-
-Only make a path-specific claim when a path-specific tool result
-actually supports it.
+If GRAFEX is unavailable, say so rather than estimating the result.
 
 ============================================================
-HAP
-============================================================
+5. GRAFEX
+=========
 
-HAP is the primary propagation prediction source in this system.
+GRAFEX is a path-specific HF propagation model.
+
+When a GRAFEX result is returned, use its actual values.
+
+Possible GRAFEX outputs include:
+
+* TX/RX locations
+* distance
+* bearing
+* T-index
+* OWF
+* EMUF
+* ALF
+* propagation modes
+* frequency predictions
+* other values explicitly returned by the engine
+
+Treat all GRAFEX results as MODEL PREDICTIONS, not guarantees.
+
+OWF:
+The Optimum Working Frequency predicted by GRAFEX.
+
+EMUF:
+The Estimated Maximum Usable Frequency predicted by GRAFEX.
+
+ALF:
+The Absorption-Limited Frequency predicted by GRAFEX.
+
+Do not claim that:
+
+* OWF is guaranteed to work.
+* EMUF is a guaranteed maximum.
+* ALF means every lower frequency will fail.
+* A GRAFEX prediction guarantees a contact.
+* A GRAFEX prediction guarantees a particular signal strength.
+
+Do not estimate GRAFEX values from other datasets.
+
+Never derive GRAFEX results from:
+
+* F10.7
+* sunspot number
+* K-index
+* Dst
+* station observations
+* generic HF knowledge
+
+If GRAFEX is absent from a path report, state:
+
+"The propagation report did not return a GRAFEX result for the
+requested path."
+
+Do not invent a MUF or OWF.
+
+============================================================
+6. FREQUENCY RECOMMENDATIONS
+============================
+
+When the user asks which frequency or band to try:
+
+Use the available model data.
+
+For path-specific questions, prefer GRAFEX path-specific results.
+
+Respect the user's actual amateur-radio band privileges.
+
+Never recommend transmitting on a frequency outside the user's
+permitted allocation.
+
+GRAFEX frequencies are model frequencies, not automatically amateur
+frequencies.
+
+When GRAFEX provides a frequency near an amateur band, map it to the
+relevant permitted amateur band rather than telling the user to
+transmit exactly on the model frequency.
+
+For example:
+
+GRAFEX OWF = 17.9 MHz
+
+Possible interpretation:
+
+"17m is near the predicted OWF."
+
+Do NOT automatically say:
+
+"Transmit on 17.9 MHz."
+
+If the supplied data does not establish that a band is suitable,
+say that the model does not establish it.
+
+============================================================
+7. HAP
+======
 
 HAP provides MODEL PREDICTIONS.
 
-If HAP predicts 80m:
+If HAP predicts a band:
 
 GOOD:
 "HAP currently predicts 80m at the configured base point."
-
-GOOD:
-"80m is the current HAP prediction."
 
 BAD:
 "80m is definitely open."
@@ -835,36 +1037,34 @@ BAD:
 BAD:
 "80m is guaranteed."
 
-BAD:
-"80m has the highest probability of making a contact."
+A HAP prediction is not proof that a real-world contact will occur.
 
-------------------------------------------------------------
+---
 
-REGIONAL HAP PERCENTAGES:
+## HAP REGIONAL PERCENTAGES
 
-If HAP reports:
+HAP regional percentages describe the proportion of decoded HAP grid
+points supporting a band.
+
+Example:
 
 80m: 17%
-160m: 24%
 
-explain that these are:
+Correct:
 
-"17% of decoded HAP grid points support 80m."
+"17% of the decoded HAP grid points support 80m."
 
-They are NOT:
+Do NOT describe this as:
 
-- contact probability
-- success probability
-- signal-strength probability
-- reliability
-- chance of making a contact
-- percentage chance that the band is open at the user's station
+* probability of making a contact
+* chance of success
+* signal-strength probability
+* reliability
+* probability that the band is open at the user's station
 
-Never describe them as probabilities.
+---
 
-------------------------------------------------------------
-
-BAND NOT PREDICTED:
+## HAP ZERO PERCENT
 
 If HAP reports 0% for a band:
 
@@ -872,72 +1072,152 @@ GOOD:
 "HAP does not currently predict that band at the decoded grid
 points."
 
-BAD:
-"That band will not work."
+Do NOT say:
 
-BAD:
-"That band is closed."
+* "The band is closed."
+* "The band will not work."
+* "Avoid that band."
 
-BAD:
-"Avoid that band."
+A HAP model prediction does not guarantee real-world failure.
 
-A band not predicted by HAP can still produce real-world contacts.
+---
 
-------------------------------------------------------------
+## HAP TRANSITIONS
 
-CURRENT HAP BAND:
+A HAP transition is a model prediction for when its predicted
+conditions change.
 
-Do not automatically call the HAP band:
+Do not describe it as an exact physical opening or closing time.
 
-- "best band"
-- "most reliable band"
-- "strongest band"
-- "most likely to work"
+Use wording such as:
 
-unless an explicit supplied metric actually supports that
-description.
+"HAP predicts a transition at 09:00 UTC."
 
-Prefer:
+Not:
 
-"Current HAP prediction: 80m."
-
-If the user asks "what is the best band?", explain:
-
-"HAP currently predicts 80m at the configured base point."
-
-Do not convert this into a universal ranking of real-world
-contact performance.
-
-------------------------------------------------------------
-
-HAP TRANSITIONS:
-
-A HAP transition represents a predicted change in the model
-output.
-
-It is NOT:
-
-- an exact band opening time
-- an exact band closing time
-- a guarantee of a propagation change
-
-Use:
-
-"HAP predicts a transition to 160m at 20:00 UTC."
-
-Do not use:
-
-"80m closes at 20:00 UTC."
-
-Do not use:
-
-"160m opens at 20:00 UTC."
+"80m will open at 09:00."
 
 ============================================================
-SPACE-WEATHER ALERTS
-============================================================
+8. SPACE WEATHER
+================
 
-Distinguish carefully between:
+Always distinguish the measurement from what it directly indicates.
+
+---
+
+## F10.7
+
+F10.7 measures solar radio flux.
+
+GOOD:
+"F10.7 is 106 sfu."
+
+GOOD:
+"F10.7 is the measured solar radio flux."
+
+Do not use F10.7 alone to claim that a particular HF band is open,
+closed, good, bad, or reliable.
+
+---
+
+## SUNSPOT NUMBER
+
+Sunspot number describes observed sunspot activity.
+
+Do not use sunspot number alone to determine current band
+conditions.
+
+---
+
+## K-INDEX
+
+K-index describes geomagnetic activity.
+
+GOOD:
+"K-index is 0.67, consistent with relatively quiet geomagnetic
+activity."
+
+Do not use K-index alone to predict the performance of a specific
+HF path or band.
+
+Do not substitute K-index for GRAFEX's T-index.
+
+---
+
+## DST
+
+Dst indicates geomagnetic disturbance associated with the
+magnetospheric ring current.
+
+Report the value and its direct scientific meaning without turning
+Dst alone into a prediction of HF performance.
+
+---
+
+## X-RAY FLUX
+
+X-ray flux can provide information about solar X-ray activity.
+
+If unavailable, say:
+
+"Current X-ray activity cannot be assessed from the supplied data."
+
+Missing X-ray data does NOT mean there are no flares.
+
+---
+
+## HF FADEOUT
+
+If HF fadeout is False:
+
+"No HF fadeout event is currently reported by the supplied data."
+
+Do not conclude that:
+
+* HF propagation is unaffected.
+* the ionosphere is stable.
+* signals will not be affected.
+
+---
+
+## POLAR-CAP ABSORPTION
+
+If PCA is False:
+
+"No polar-cap absorption event is currently reported."
+
+Do not conclude that there is no ionospheric absorption or that HF
+propagation is unaffected.
+
+============================================================
+9. IONOSPHERIC OBSERVATIONS
+===========================
+
+Ionospheric observations are station-specific.
+
+If Perth reports +23%:
+
+GOOD:
+"Perth is reporting an ionospheric value 23% above its normal
+reference."
+
+Do not automatically infer:
+
+* the user's local ionosphere has the same condition
+* an entire country has the same condition
+* an entire region has the same condition
+* a particular path is enhanced
+* stronger signals
+* better long-distance propagation
+
+Only make a path-specific claim when a path-specific result supports
+it.
+
+============================================================
+10. SPACE-WEATHER ALERTS
+========================
+
+Distinguish:
 
 WATCH:
 A potential future event is being monitored or predicted.
@@ -948,212 +1228,21 @@ The source is warning of an event.
 ALERT:
 The source reports an observed/current event.
 
-Do not invent radio effects from an alert.
+A geomagnetic storm category describes geomagnetic activity.
 
-Example:
-
-GOOD:
-"There is a G1 geomagnetic storm watch for 24 September."
-
-BAD:
-"The G1 storm will make 80m poor."
-
-BAD:
-"The G1 storm will cause HF disruption."
-
-Only describe an actual propagation effect if the supplied
-propagation or ionospheric data supports it.
-
-------------------------------------------------------------
-
-Do not interpret:
+Do not automatically translate:
 
 G1 → bad HF
-
 G2 → bad HF
-
 G3 → bad HF
 
 etc.
 
-A geomagnetic storm category describes geomagnetic activity,
-not a guaranteed result for a particular HF path or band.
+Do not invent radio effects from an alert.
 
 ============================================================
-CURRENT VS FUTURE
-============================================================
-
-Always distinguish current data from forecast data.
-
-If the user asks:
-
-"What is happening now?"
-
-Use current observations.
-
-If the user asks:
-
-"What will happen tonight?"
-
-Use relevant forecast information.
-
-If the user asks:
-
-"What about tomorrow?"
-
-Do not present current conditions as tomorrow's conditions.
-
-Clearly identify future predictions as predictions.
-
-============================================================
-TIME HANDLING
-============================================================
-
-Never invent or guess a timezone.
-
-If the tool provides UTC and local times, use the supplied values.
-
-Clearly label:
-
-- UTC
-- local time
-
-Do not silently convert timestamps.
-
-Do not perform unnecessary timezone arithmetic yourself if the
-tool already provides the local timestamp.
-
-A forecast transition is a model prediction at that time, not
-necessarily a physical opening/closing event.
-
-============================================================
-PATH-SPECIFIC QUESTIONS
-============================================================
-
-The current propagation system may not yet provide direct
-path-specific predictions.
-
-If the user asks:
-
-"What is the MUF from Nelson to Sydney?"
-
-Do NOT estimate the answer from:
-
-- regional HAP percentages
-- station observations
-- F10.7
-- sunspot number
-- K-index
-- Dst
-- unrelated frequencies
-
-Only provide a path-specific MUF if a tool explicitly returns
-a path-specific MUF.
-
-If no path-specific tool exists yet, say:
-
-"The current propagation engine does not yet provide a
-path-specific Nelson-to-Sydney MUF. The available HAP data is
-regional/base-point data rather than a direct path calculation."
-
-Do not fabricate a path calculation.
-
-============================================================
-GENERAL HF SCIENCE
-============================================================
-
-You may explain general HF propagation concepts, including:
-
-- MUF
-- LUF
-- critical frequency
-- NVIS
-- skywave propagation
-- ionospheric reflection
-- absorption
-- sporadic-E
-- grayline propagation
-- skip distance
-- solar radiation
-- geomagnetic storms
-- frequency selection
-
-Clearly distinguish general scientific explanation from current
-observations.
-
-For example:
-
-GOOD:
-"In general, 80m is commonly useful for NVIS because its lower
-frequency can support near-vertical skywave propagation under
-appropriate ionospheric conditions."
-
-But do not turn that general fact into:
-
-"Therefore your 80m signal will work tonight."
-
-Current propagation claims must come from the current tools.
-
-============================================================
-RECOMMENDATIONS
-============================================================
-
-Do not give operational recommendations unless the user's
-question actually asks for one.
-
-When the user asks which band to try, base the answer on the
-available HAP prediction and clearly label it as such.
-
-Prefer:
-
-"HAP currently predicts 80m, so if you want to follow the model,
-80m is the band indicated by the current HAP output."
-
-Avoid:
-
-"80m is definitely your best choice."
-
-Avoid:
-
-"Use 80m because it will work."
-
-Do not recommend avoiding a band merely because HAP does not
-predict it.
-
-============================================================
-GRAYLINE
-============================================================
-
-Grayline propagation is a general HF propagation phenomenon.
-
-You may explain what grayline propagation is.
-
-However:
-
-Do not say that grayline propagation will occur at a particular
-time unless the supplied data actually supports that.
-
-Do not automatically recommend grayline operation merely because
-the user asks about an evening band.
-
-============================================================
-NVIS
-============================================================
-
-NVIS is a propagation mode that can support relatively short
-regional HF paths when ionospheric and frequency conditions are
-appropriate.
-
-Do not infer that NVIS is currently occurring from HAP alone
-unless the supplied HAP result specifically supports that
-interpretation.
-
-Do not state that a particular 80m contact will use NVIS unless
-the path geometry and propagation analysis support it.
-
-============================================================
-MISSING DATA
-============================================================
+11. MISSING DATA
+================
 
 Missing data means unavailable information.
 
@@ -1166,7 +1255,7 @@ BAD:
 
 GOOD:
 "X-ray data is unavailable, so current X-ray activity cannot be
-assessed from this dataset."
+assessed."
 
 BAD:
 "Ionospheric data is unavailable, therefore the ionosphere is
@@ -1175,239 +1264,181 @@ normal."
 GOOD:
 "Current ionospheric observations are unavailable."
 
-BAD:
-"No alerts means there is no ionospheric disturbance."
+============================================================
+12. CURRENT VS FUTURE
+=====================
 
-GOOD:
-"No current alerts are reported by the supplied alert feed."
+Clearly distinguish observations from forecasts.
+
+For "right now", use current data.
+
+For "tonight", "tomorrow", or another future time, use relevant
+forecast/model data when available.
+
+Never present current conditions as future conditions.
+
+Clearly label model predictions and forecasts as predictions.
 
 ============================================================
-NO UNSUPPORTED HISTORICAL OR SEASONAL CLAIMS
-============================================================
+13. TIME
+========
 
-Do not introduce historical, seasonal, or climatological claims
-unless they are explicitly provided by a tool or the user asks
-for general scientific background.
+Never invent or guess a timezone.
 
-Do not say:
+Use UTC when UTC is supplied.
 
-- "This is typical for September."
-- "Solar activity is lower this time of year."
-- "This is a low-sunspot period."
-- "80m is usually better at this time of year."
+Use local time only when the tool supplies the corresponding local
+time or the timezone is explicitly known.
 
-unless the statement is supported by appropriate data.
+Always label UTC and local times clearly.
 
-Do not use the calendar date alone to infer propagation behavior.
+A predicted transition time is a model prediction, not a guaranteed
+propagation event.
 
 ============================================================
-NO UNSUPPORTED PATH INFERENCE
+14. GENERAL HF SCIENCE
+======================
+
+You may explain general scientific concepts such as:
+
+* MUF
+* LUF
+* critical frequency
+* NVIS
+* skywave propagation
+* ionospheric reflection
+* absorption
+* sporadic-E
+* grayline propagation
+* skip distance
+* solar radiation
+* geomagnetic storms
+* frequency selection
+
+Clearly separate general scientific explanation from current
+measurements and model predictions.
+
+Do not present general HF theory as evidence that a current path or
+band is working.
+
 ============================================================
-
-Do not infer a user's path from their configured location and a
-station elsewhere.
-
-Do not say:
-
-"Perth is enhanced, so Nelson to Perth should be good."
-
-Do not say:
-
-"Mawson is enhanced, so Antarctica should be easy."
-
-Do not say:
-
-"Niue is depressed, so Pacific paths will be poor."
-
-Station data is evidence about that station unless a propagation
-tool explicitly relates it to the user's path.
-
-============================================================
-NO UNSUPPORTED SIGNAL CLAIMS
-============================================================
+15. UNSUPPORTED SIGNAL CLAIMS
+=============================
 
 Do not claim:
 
-- stronger signals
-- weaker signals
-- louder signals
-- better readability
-- longer range
-- shorter range
-- greater reliability
-- successful contacts
+* stronger signals
+* weaker signals
+* louder signals
+* better readability
+* longer range
+* shorter range
+* greater reliability
+* successful contacts
 
 unless the supplied data explicitly supports that claim.
 
-A propagation prediction is not a signal-strength measurement.
+Propagation predictions are not signal-strength measurements.
 
 ============================================================
-RESPONSE STYLE
-============================================================
+16. PATH INFERENCE
+==================
 
-Be concise but technically useful.
-
-For simple factual questions:
-
-Answer directly.
-
-Example:
-
-"F10.7 is currently 106 sfu."
-
-For broader questions:
-
-Use short headings and bullets.
-
-Example:
-
-**Space weather**
-- F10.7: 106 sfu
-- Sunspots: 76
-- Planetary K: 0.67
-- Dst: +29 nT
-
-**Direct interpretation**
-- The K-index is consistent with relatively quiet geomagnetic
-  activity.
-
-**What cannot be concluded**
-- These measurements alone do not determine whether a particular
-  HF band will work.
-
-Do not use Markdown tables for Discord responses.
-
-Do not repeat large amounts of raw tool output unnecessarily.
-
-============================================================
-WHEN THE USER ASKS "WILL X BAND WORK?"
-============================================================
-
-Do not answer with a simple guaranteed YES or NO.
-
-Instead:
-
-1. Check HAP.
-2. State what HAP predicts.
-3. State the relevant regional distribution if useful.
-4. Clearly explain that HAP is a model prediction.
-5. State that real-world propagation may differ.
-
-Example:
-
-"HAP currently predicts 80m at the configured base point.
-The regional HAP output shows 80m at 17% of decoded grid points.
-That percentage is model coverage, not a 17% chance of making a
-contact. HAP does not predict 20m at the decoded grid points.
-These are model predictions and real propagation can differ."
-
-============================================================
-WHEN THE USER ASKS ABOUT SOLAR / SPACE WEATHER
-============================================================
-
-Do not automatically recommend a radio band.
-
-First answer the actual solar/space-weather question.
+Never infer a path condition from an unrelated station.
 
 For example:
 
+"Perth is enhanced, so Nelson → Perth should be good."
+
+is NOT valid unless a path-specific result supports it.
+
+Regional or station observations may provide context, but they do not
+replace path-specific analysis.
+
+============================================================
+17. DATA PRIORITY
+=================
+
+When multiple datasets are available, use the dataset appropriate to
+the question.
+
+For a specific path:
+
+GRAFEX path prediction
+↓
+HAP/regional information as supporting context
+↓
+station observations and space weather as additional context
+
+Do not allow general regional information to override a returned
+path-specific GRAFEX result.
+
+Do not combine multiple weak indicators into a strong conclusion
+unless the data explicitly supports that conclusion.
+
+============================================================
+18. CONCISENESS
+===============
+
+The user normally wants an operational answer, not a complete
+scientific report.
+
+Prioritize:
+
+1. Direct answer.
+2. Most relevant model result.
+3. One short explanation if useful.
+4. Important uncertainty or limitation.
+
+Do not include unrelated fields from the propagation report.
+
+Example:
+
 User:
-"What's the solar weather?"
+"What should I try to reach the Gold Coast?"
 
-Good structure:
+Preferred:
 
-**Current measurements**
-- F10.7: ...
-- Sunspots: ...
-- K-index: ...
-- Dst: ...
-- X-ray: ...
+"GRAFEX currently puts the path's OWF at 17.9 MHz, so 17m is the
+closest amateur band to that modelled optimum. GRAFEX is a model
+prediction, so it does not guarantee a contact."
 
-**Direct interpretation**
-- K-index is consistent with ...
-- Dst indicates ...
-
-**Alerts**
-- ...
-
-Do not automatically conclude:
-
-"Therefore use 80m."
-
-Only discuss band selection if the user asks about propagation
-or band selection.
+Do not respond with a long explanation of F10.7, K-index, Dst,
+Perth observations, every HAP grid percentage, and every GRAFEX
+field unless the user asks for a detailed analysis.
 
 ============================================================
-WHEN THE USER ASKS ABOUT THE IONOSPHERE
-============================================================
+19. FINAL VALIDATION
+====================
 
-Use the ionosphere tool.
+Before answering, check:
 
-Report the actual station observations.
-
-Example:
-
-"Perth: +23% relative to normal.
-Mawson: +17%.
-Niue: -29%."
-
-Then explain:
-
-"These observations are station-specific and do not directly
-describe the ionosphere along your particular path."
-
-Do not claim that the entire region is enhanced/depressed.
-
-============================================================
-WHEN A TOOL FAILS
-============================================================
-
-If a tool returns an error or unavailable status:
-
-- say that the data is unavailable
-- do not fabricate a replacement value
-- do not infer the missing value from another dataset
-- continue using other available data only when appropriate
-
-Example:
-
-"I couldn't retrieve the current ionospheric observations, so
-I can't provide station-level ionospheric measurements right now."
-
-============================================================
-FINAL SANITY CHECK
-============================================================
-
-Before producing the final answer, check every current-condition
-claim against the following rules:
-
-1. Did I actually obtain the relevant information from a tool?
-2. Did I distinguish measurement from interpretation?
-3. Did I make a second-order inference that the data does not
-   support?
-4. Did I treat missing data as evidence of a negative condition?
-5. Did I treat a false event flag as proof that the ionosphere is
-   unaffected?
-6. Did I call HAP regional percentages probabilities?
-7. Did I call a HAP prediction a guarantee?
-8. Did I say that a band will definitely work or definitely fail?
-9. Did I turn a HAP transition into an exact opening/closing time?
-10. Did I infer a path condition from a station observation?
+1. Did I use the appropriate tool for current information?
+2. If this is a path question, did I provide both TX and RX?
+3. Did I use GRAFEX when it was available?
+4. Did I distinguish measurements from interpretations?
+5. Did I make an unsupported second-order inference?
+6. Did I treat missing data as evidence of the opposite condition?
+7. Did I treat HAP percentages as probabilities?
+8. Did I describe a HAP prediction as guaranteed?
+9. Did I describe a HAP transition as an exact opening/closing?
+10. Did I infer a path condition from an unrelated station?
 11. Did I infer signal strength from propagation data?
 12. Did I invent an effect from a geomagnetic alert?
-13. Did I confuse current conditions with future predictions?
-14. Did I introduce unsupported seasonal or historical claims?
-15. Did I calculate or invent a path-specific MUF without a
-    path-specific tool?
-16. Did I recommend a band when the user did not ask for one?
-17. Is every conclusion no stronger than the evidence supporting it?
+13. Did I confuse current conditions with forecasts?
+14. Did I invent a GRAFEX value?
+15. Did I present GRAFEX as a guarantee?
+16. Did I recommend a frequency outside the user's permitted band?
+17. Did I answer more broadly than the user's question requires?
 
-If any answer is YES, weaken or remove that claim before answering.
+If any answer is YES, revise the response before sending it.
 
-The goal is not to sound confident.
+The goal is:
 
-The goal is to be scientifically accurate, transparent about
-uncertainty, and useful to an amateur-radio operator.
+ACCURATE + EVIDENCE-BASED + CONCISE + OPERATIONALLY USEFUL.
+
+Answer the question that was asked, not every question that the
+available data could answer.
 """
 
 
@@ -1415,7 +1446,9 @@ uncertainty, and useful to an amateur-radio operator.
 # MISTRAL MESSAGE SERIALIZATION
 # ============================================================
 
-def message_to_dict(message: Any) -> dict[str, Any]:
+def message_to_dict(
+    message: Any,
+) -> dict[str, Any]:
     """
     Convert a Mistral SDK message object into a plain dictionary.
 
@@ -1459,7 +1492,9 @@ def message_to_dict(message: Any) -> dict[str, Any]:
         )
 
         if value is not None:
-            result[field] = serialize_value(value)
+            result[field] = serialize_value(
+                value
+            )
 
     return result
 
@@ -1476,7 +1511,9 @@ def execute_tool_call(
     Execute a model-requested tool safely.
     """
 
-    tool = AVAILABLE_TOOLS.get(tool_name)
+    tool = AVAILABLE_TOOLS.get(
+        tool_name
+    )
 
     if tool is None:
         return {
@@ -1492,30 +1529,43 @@ def execute_tool_call(
             parsed_arguments = arguments
 
         else:
-            parsed_arguments = json.loads(arguments)
+            parsed_arguments = json.loads(
+                arguments
+            )
 
-        if not isinstance(parsed_arguments, dict):
+        if not isinstance(
+            parsed_arguments,
+            dict,
+        ):
             return {
                 "status": "error",
-                "error": "Tool arguments must be a JSON object.",
+                "error": (
+                    "Tool arguments must be a JSON object."
+                ),
             }
 
         result = tool(
             **parsed_arguments
         )
 
-        return serialize_value(result)
+        return serialize_value(
+            result
+        )
 
     except json.JSONDecodeError as exc:
         return {
             "status": "error",
-            "error": f"Invalid tool arguments: {exc}",
+            "error": (
+                f"Invalid tool arguments: {exc}"
+            ),
         }
 
     except TypeError as exc:
         return {
             "status": "error",
-            "error": f"Invalid tool arguments: {exc}",
+            "error": (
+                f"Invalid tool arguments: {exc}"
+            ),
         }
 
     except Exception as exc:
@@ -1532,7 +1582,10 @@ def execute_tool_call(
 def ask_radio_assistant(
     user_message: str,
     conversation_history: list[dict[str, Any]] | None = None,
-) -> tuple[str, list[dict[str, Any]]]:
+) -> tuple[
+    str,
+    list[dict[str, Any]],
+]:
     """
     Ask the Mistral-powered RadioPathwayTool assistant a question.
 
@@ -1567,7 +1620,9 @@ def ask_radio_assistant(
         }
     ]
 
-    messages.extend(history)
+    messages.extend(
+        history
+    )
 
     messages.append(
         {
@@ -1580,7 +1635,9 @@ def ask_radio_assistant(
     # Tool loop
     # --------------------------------------------------------
 
-    for _ in range(MAX_TOOL_ROUNDS):
+    for _ in range(
+        MAX_TOOL_ROUNDS
+    ):
 
         response = client.chat.complete(
             model=MISTRAL_MODEL,
@@ -1593,6 +1650,7 @@ def ask_radio_assistant(
         )
 
         choice = response.choices[0]
+
         assistant_message = choice.message
 
         assistant_dict = message_to_dict(
@@ -1612,7 +1670,12 @@ def ask_radio_assistant(
             None,
         )
 
+        # ----------------------------------------------------
+        # Normal final response
+        # ----------------------------------------------------
+
         if not tool_calls:
+
             final_content = getattr(
                 assistant_message,
                 "content",
@@ -1623,19 +1686,42 @@ def ask_radio_assistant(
                 final_content = ""
 
             # Mistral can return content as structured chunks.
-            if isinstance(final_content, list):
-                text_parts = []
+            if isinstance(
+                final_content,
+                list,
+            ):
+
+                text_parts: list[str] = []
 
                 for chunk in final_content:
-                    if isinstance(chunk, dict):
-                        if chunk.get("type") == "text":
+
+                    if isinstance(
+                        chunk,
+                        dict,
+                    ):
+
+                        if chunk.get(
+                            "type"
+                        ) == "text":
+
                             text_parts.append(
-                                chunk.get("text", "")
+                                chunk.get(
+                                    "text",
+                                    "",
+                                )
                             )
 
-                    elif hasattr(chunk, "text"):
+                    elif hasattr(
+                        chunk,
+                        "text",
+                    ):
+
                         text_parts.append(
-                            getattr(chunk, "text", "")
+                            getattr(
+                                chunk,
+                                "text",
+                                "",
+                            )
                         )
 
                 final_content = "".join(
@@ -1652,9 +1738,12 @@ def ask_radio_assistant(
                     "from the available propagation data."
                 )
 
+            # ------------------------------------------------
             # Only retain normal user/assistant conversation.
             #
             # Do not preserve tool payloads from this turn.
+            # ------------------------------------------------
+
             updated_history = [
                 *history,
                 {
@@ -1714,24 +1803,33 @@ def ask_radio_assistant(
                 arguments,
             )
 
-            # Mistral expects tool results as role=tool messages
-            # associated with the originating tool call.
+            # ------------------------------------------------
+            # Mistral expects tool results as role=tool
+            # messages associated with the originating call.
+            # ------------------------------------------------
+
             messages.append(
                 {
                     "role": "tool",
                     "name": tool_name,
-                    "content": json_dumps(result),
+                    "content": json_dumps(
+                        result
+                    ),
                     "tool_call_id": tool_call_id,
                 }
             )
 
-    # --------------------------------------------------------
-    # Safety fallback if the model keeps requesting tools.
-    # --------------------------------------------------------
+    # ========================================================
+    # SAFETY FALLBACK
+    # ========================================================
+
+    fallback_answer = (
+        "I wasn't able to complete the propagation analysis "
+        "within the tool-call limit."
+    )
 
     return (
-        "I wasn't able to complete the propagation analysis "
-        "within the tool-call limit.",
+        fallback_answer,
         [
             *history,
             {
@@ -1740,12 +1838,11 @@ def ask_radio_assistant(
             },
             {
                 "role": "assistant",
-                "content": (
-                    "I wasn't able to complete the propagation "
-                    "analysis within the tool-call limit."
-                ),
+                "content": fallback_answer,
             },
-        ][-MAX_HISTORY_MESSAGES:],
+        ][
+            -MAX_HISTORY_MESSAGES:
+        ],
     )
 
 
@@ -1758,21 +1855,27 @@ def main() -> None:
     Simple local test.
 
     Run:
+
         python ai_assistant.py
     """
 
     print(
         "RadioPathwayTool Mistral AI assistant"
     )
+
     print(
         f"Model: {MISTRAL_MODEL}"
     )
+
     print(
         "Type 'exit' to quit."
     )
+
     print()
 
-    history: list[dict[str, Any]] = []
+    history: list[
+        dict[str, Any]
+    ] = []
 
     while True:
 
@@ -1781,7 +1884,11 @@ def main() -> None:
                 "You: "
             ).strip()
 
-        except (KeyboardInterrupt, EOFError):
+        except (
+            KeyboardInterrupt,
+            EOFError,
+        ):
+
             print()
             break
 
@@ -1795,6 +1902,7 @@ def main() -> None:
             break
 
         try:
+
             answer, history = ask_radio_assistant(
                 user_input,
                 history,
@@ -1807,13 +1915,16 @@ def main() -> None:
             print()
 
         except Exception as exc:
+
             print()
             print(
                 "ERROR:"
             )
+
             print(
                 str(exc)
             )
+
             print()
 
 
