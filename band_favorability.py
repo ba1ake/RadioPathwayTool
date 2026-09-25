@@ -256,6 +256,7 @@ class HAPCollector:
         ncols: int = 7,
         step_lat: float = 5.0,
         step_lon: float = 5.0,
+        tindex: int = 5,
     ) -> HAPConfig:
 
         centre_row = nrows // 2
@@ -281,6 +282,7 @@ class HAPCollector:
             step_lon=step_lon,
             nrows=nrows,
             ncols=ncols,
+            tindex=tindex,
         )
 
     # ------------------------------------------------------------------------

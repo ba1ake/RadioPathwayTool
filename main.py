@@ -198,6 +198,7 @@ class PropagationReport:
     next_transition_frequency_mhz: Optional[float]
 
     regional_distribution: dict[str, int]
+    hap_forecast: dict[int, dict[str, Any]]
 
     # -----------------------------------------------------------------------
     # Supporting data
@@ -340,6 +341,7 @@ def create_hap_config(
     location_name: str = LOCATION_NAME,
     latitude: float = LOCATION_LATITUDE,
     longitude: float = LOCATION_LONGITUDE,
+    t_index: Optional[float] = None,
 ) -> HAPConfig:
     """
     Create the HAP configuration centred on the requested transmitter
@@ -359,6 +361,11 @@ def create_hap_config(
         ncols=HAP_GRID_COLS,
         step_lat=HAP_GRID_STEP_LAT,
         step_lon=HAP_GRID_STEP_LON,
+        tindex=(
+            int(round(t_index))
+            if t_index is not None
+            else 5
+        ),
     )
 
 
@@ -367,6 +374,7 @@ def collect_hap(
     location_name: str = LOCATION_NAME,
     latitude: float = LOCATION_LATITUDE,
     longitude: float = LOCATION_LONGITUDE,
+    t_index: Optional[float] = None,
 ) -> tuple[Any, Any]:
     """
     Collect and decode the complete HAP forecast.
@@ -380,6 +388,7 @@ def collect_hap(
         location_name=location_name,
         latitude=latitude,
         longitude=longitude,
+        t_index=t_index,
     )
 
     collector = HAPCollector()
@@ -426,9 +435,15 @@ def extract_hap_base_recommendation(
     Returns:
         band
         frequency MHz
-        support
+        sample support
 
     If no usable recommendation exists, all three values are None.
+
+    NOTE:
+        sample_support is decoder/sample support. It represents how many
+        local pixels contributed to the decoded recommendation. It is not
+        a propagation probability, signal-strength estimate, or contact
+        reliability score.
     """
 
     try:
@@ -458,9 +473,13 @@ def extract_hap_base_recommendation(
             else None
         )
 
+        # HAPRecommendation uses sample_support.
+        #
+        # This is decoder/sample support, NOT a propagation confidence
+        # percentage or probability of successful communication.
         support = getattr(
             recommendation,
-            "support",
+            "sample_support",
             None,
         )
 
@@ -1204,6 +1223,7 @@ def build_ionosphere_report(
                     f"{getattr(observation, 'condition', 'unknown')} "
                     f"(+{percent:.0f}%)"
                 )
+
             else:
                 condition_text = (
                     f"{getattr(observation, 'condition', 'unknown')} "
@@ -1211,6 +1231,7 @@ def build_ionosphere_report(
                 )
 
         else:
+
             condition_text = getattr(
                 observation,
                 "condition",
@@ -2692,6 +2713,24 @@ def get_propagation_report(
         )
 
     # -----------------------------------------------------------------------
+    # SHARED T-INDEX SELECTION
+    # -----------------------------------------------------------------------
+
+    # Select the direct SWS T-index once for the requested path.
+    #
+    # This exact value is shared by both HAP and GRAFEX so that the two
+    # propagation models are operating from the same ionospheric input.
+    t_index = None
+
+    if rx_location is not None:
+        t_index = extract_grafex_t_index(
+            tx_location=tx_location,
+            rx_location=rx_location,
+            weather=weather,
+            weather_report=space_weather,
+        )
+
+    # -----------------------------------------------------------------------
     # IONOSPHERE
     # -----------------------------------------------------------------------
 
@@ -2732,7 +2771,7 @@ def get_propagation_report(
     next_transition_frequency_mhz = None
 
     regional_distribution = {}
-
+    hap_forecast = {}
     try:
 
         (
@@ -2743,6 +2782,7 @@ def get_propagation_report(
             location_name=resolved_tx_name,
             latitude=tx_latitude,
             longitude=tx_longitude,
+            t_index=t_index,
         )
 
         status.hap_available = True
@@ -2785,6 +2825,35 @@ def get_propagation_report(
             decoded_hap,
             current_hour,
         )
+        for hour in range(24):
+
+            recommendation = (
+                decoder.get_base_recommendation(
+                    decoded=decoded_hap,
+                    hour_utc=hour,
+                )
+            )
+
+            if recommendation is None:
+                hap_forecast[hour] = {
+                    "band": None,
+                    "frequency_mhz": None,
+                    "support": None,
+                }
+
+                continue
+
+            hap_forecast[hour] = {
+                "band": recommendation.band,
+                "frequency_mhz": (
+                    recommendation.frequency_khz / 1000.0
+                ),
+                "support": getattr(
+                    recommendation,
+                    "sample_support",
+                    None,
+                ),
+            }
 
     except Exception as exc:
 
@@ -2801,17 +2870,6 @@ def get_propagation_report(
     grafex = None
 
     if rx_location is not None:
-
-        # Select a direct SWS T-index for the requested path.
-        #
-        # This is deliberately done only after space_weather.py has
-        # provided its live T-index dictionary.
-        t_index = extract_grafex_t_index(
-            tx_location=tx_location,
-            rx_location=rx_location,
-            weather=weather,
-            weather_report=space_weather,
-        )
 
         prediction_date = (
             current_time.date()
@@ -2873,6 +2931,10 @@ def get_propagation_report(
             regional_distribution
         ),
 
+        hap_forecast=(
+            hap_forecast
+        ),
+
         # Supporting data
         ionosphere_observations=(
             ionosphere_observations
@@ -2929,4 +2991,4 @@ def main() -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    main()
+    main() 
