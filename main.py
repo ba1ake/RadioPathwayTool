@@ -1762,186 +1762,271 @@ def format_space_weather(
 # GRAFEX TEXT FORMATTING
 # ---------------------------------------------------------------------------
 
-def format_grafex_summary(
-    grafex: dict[str, Any],
-) -> list[str]:
+def format_grafex_summary(grafex: dict[str, Any]) -> list[str]:
     """
-    Produce a concise human-readable summary of the GRAFEX prediction.
+    Compact Discord-friendly GRAFEX formatter.
 
-    The complete structured GRAFEX data remains available in report.grafex.
+    This only changes presentation. The underlying GRAFEX data remains
+    unchanged in report.grafex.
     """
 
-    lines = []
+    def val(obj: Any, *names: str, default: Any = None) -> Any:
+        if isinstance(obj, dict):
+            for name in names:
+                if name in obj:
+                    return obj[name]
+        return default
 
-    tx_name = grafex.get(
-        "tx_name"
-    )
+    def number(value: Any, decimals: int = 1) -> str:
+        if value is None:
+            return "—"
 
-    rx_name = grafex.get(
-        "rx_name"
-    )
-
-    distance_km = grafex.get(
-        "distance_km"
-    )
-
-    prediction_date = grafex.get(
-        "prediction_date"
-    )
-
-    t_index = grafex.get(
-        "t_index"
-    )
-
-    if tx_name and rx_name:
-        lines.append(
-            f"Path: {tx_name} -> {rx_name}"
-        )
-
-    if distance_km is not None:
         try:
-            lines.append(
-                f"Distance: {float(distance_km):.0f} km"
-            )
+            return f"{float(value):.{decimals}f}"
         except (TypeError, ValueError):
-            lines.append(
-                f"Distance: {distance_km} km"
-            )
+            return str(value)
 
-    if prediction_date:
-        lines.append(
-            f"Prediction date: {prediction_date}"
-        )
+    def symbols(value: Any) -> str:
+        if isinstance(value, dict):
+            items = []
+
+            def sort_key(item: tuple[Any, Any]) -> tuple[int, str]:
+                key = str(item[0])
+                if key.isdigit():
+                    return (0, f"{int(key):04d}")
+                return (1, key)
+
+            for _, symbol in sorted(value.items(), key=sort_key):
+                items.append(str(symbol))
+
+            return "".join(items)
+
+        if isinstance(value, (list, tuple)):
+            return "".join(str(x) for x in value)
+
+        if isinstance(value, str):
+            return value.replace(" ", "")
+
+        return "—"
+
+    tx = val(
+        grafex,
+        "tx_name",
+        "transmitter_name",
+        default="Unknown",
+    )
+
+    rx = val(
+        grafex,
+        "rx_name",
+        "receiver_name",
+        default="Unknown",
+    )
+
+    prediction_date = val(
+        grafex,
+        "prediction_date",
+        "date",
+    )
+
+    distance = val(
+        grafex,
+        "distance_km",
+        "distance",
+    )
+
+    tx_bearing = val(
+        grafex,
+        "tx_to_rx_bearing",
+        "tx_rx_bearing",
+        "bearing_tx_rx",
+    )
+
+    rx_bearing = val(
+        grafex,
+        "rx_to_tx_bearing",
+        "rx_tx_bearing",
+        "bearing_rx_tx",
+    )
+
+    t_index = val(
+        grafex,
+        "t_index",
+        "tindex",
+    )
+
+    primary = val(
+        grafex,
+        "primary_mode",
+        default="—",
+    )
+
+    secondary = val(
+        grafex,
+        "secondary_mode",
+        default="—",
+    )
+
+    hours = val(
+        grafex,
+        "hours",
+        "hourly",
+        "hourly_data",
+        default=[],
+    )
+
+    if not isinstance(hours, list):
+        hours = []
+
+    lines: list[str] = []
+
+    # --------------------------------------------------------------
+    # HEADER
+    # --------------------------------------------------------------
+
+    lines.append("📡 GRAFEX — Path Prediction")
+    lines.append("")
+    lines.append(f"**{tx} → {rx}**")
+
+    if prediction_date is not None:
+        lines.append(f"Date: {prediction_date}")
+
+    if distance is not None:
+        try:
+            lines.append(f"Distance: {float(distance):,.0f} km")
+        except (TypeError, ValueError):
+            lines.append(f"Distance: {distance} km")
+
+    if tx_bearing is not None:
+        lines.append(f"TX → RX: {number(tx_bearing, 0)}°")
+
+    if rx_bearing is not None:
+        lines.append(f"RX → TX: {number(rx_bearing, 0)}°")
 
     if t_index is not None:
-        lines.append(
-            f"GRAFEX T-index: {t_index}"
-        )
+        lines.append(f"T-index: {number(t_index, 0)}")
 
-    bearing = grafex.get(
-        "bearing_tx_to_rx"
-    )
+    lines.append(f"Mode: {primary}")
 
-    if bearing is not None:
-        try:
-            lines.append(
-                f"TX bearing: {float(bearing):.1f}°"
-            )
-        except (TypeError, ValueError):
-            pass
+    if secondary not in (None, "", "—"):
+        lines.append(f"Secondary: {secondary}")
 
-    first_mode = grafex.get(
-        "first_mode"
-    )
+    # --------------------------------------------------------------
+    # HOURLY DATA
+    # --------------------------------------------------------------
 
-    second_mode = grafex.get(
-        "second_mode"
-    )
-
-    if first_mode or second_mode:
-
-        modes = [
-            mode
-            for mode in (
-                first_mode,
-                second_mode,
-            )
-            if mode
-        ]
-
-        lines.append(
-            "Propagation modes: "
-            + " / ".join(
-                str(mode)
-                for mode in modes
-            )
-        )
-
-    # -----------------------------------------------------------------------
-    # Hourly predictions
-    # -----------------------------------------------------------------------
-
-    hours = grafex.get(
-        "hours"
-    )
-
-    if isinstance(
-        hours,
-        list,
-    ) and hours:
-
+    if hours:
         lines.append("")
+        lines.append("**UTC hourly prediction**")
+        lines.append("```")
         lines.append(
-            "GRAFEX hourly path prediction:"
+            "UTC   OWF       EMUF      ALF       Symbols"
         )
-
-        shown = 0
+        lines.append(
+            "      1st/2nd   1st/2nd   1st/2nd"
+        )
 
         for hour in hours:
+            if not isinstance(hour, dict):
+                continue
 
-            if not isinstance(
+            utc = val(
                 hour,
-                dict,
-            ):
-                continue
-
-            utc_hour = hour.get(
-                "utc_hour"
+                "utc_hour",
+                "hour",
+                "utc",
             )
 
-            frequencies = hour.get(
-                "frequencies",
-                {},
+            try:
+                utc_text = f"{int(utc):02d}"
+            except (TypeError, ValueError):
+                utc_text = str(utc)
+
+            first_owf = val(
+                hour,
+                "first_owf_mhz",
+                "first_owf",
+                "owf_first",
             )
 
-            if not isinstance(
-                frequencies,
-                dict,
-            ):
-                continue
+            second_owf = val(
+                hour,
+                "second_owf_mhz",
+                "second_owf",
+                "owf_second",
+            )
 
-            supported_bands = []
+            first_emuf = val(
+                hour,
+                "first_emuf_mhz",
+                "first_emuf",
+                "emuf_first",
+            )
 
-            for band, prediction in frequencies.items():
+            second_emuf = val(
+                hour,
+                "second_emuf_mhz",
+                "second_emuf",
+                "emuf_second",
+            )
 
-                if not isinstance(
-                    prediction,
-                    dict,
-                ):
-                    continue
+            first_alf = val(
+                hour,
+                "first_alf_mhz",
+                "first_alf",
+                "alf_first",
+            )
 
-                if prediction.get(
-                    "supported"
-                ):
-                    supported_bands.append(
-                        str(band)
-                    )
+            second_alf = val(
+                hour,
+                "second_alf_mhz",
+                "second_alf",
+                "alf_second",
+            )
 
-            if supported_bands:
+            symbol_data = val(
+                hour,
+                "frequency_symbols",
+                "symbols",
+                "symbol_block",
+            )
 
-                try:
-                    hour_text = f"{int(utc_hour):02d}"
-                except (TypeError, ValueError):
-                    hour_text = str(utc_hour)
+            symbol_text = symbols(symbol_data)
 
-                lines.append(
-                    f"  {hour_text} UTC: "
-                    + ", ".join(
-                        supported_bands
-                    )
-                )
+            # Compact pair formatting.
+            owf = f"{number(first_owf)}/{number(second_owf)}"
+            emuf = f"{number(first_emuf)}/{number(second_emuf)}"
+            alf = f"{number(first_alf)}/{number(second_alf)}"
 
-                shown += 1
+            lines.append(
+                f"{utc_text}:00 "
+                f"{owf:<11}"
+                f"{emuf:<11}"
+                f"{alf:<11}"
+                f"{symbol_text}"
+            )
 
-            if shown >= 24:
-                break
+        lines.append("```")
+
+    # --------------------------------------------------------------
+    # LEGEND
+    # --------------------------------------------------------------
+
+    lines.append("")
+    lines.append("**Symbols**")
+    lines.append(
+        "`.` <50% usable · `%` 50–90% · `B` both modes · "
+        "`M` mixed F modes"
+    )
+    lines.append(
+        "`F` first F mode · `E` E-layer · `P` E/F · "
+        "`S` second mode"
+    )
+    lines.append(
+        "`A` high absorption · `X` complex modes"
+    )
 
     return lines
-
-
-# ---------------------------------------------------------------------------
-# SPACE WEATHER ALERT FORMATTING
-# ---------------------------------------------------------------------------
 
 def extract_alert_message(
     alert: dict[str, Any],

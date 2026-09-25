@@ -441,16 +441,19 @@ def tool_get_hap_forecast(
     If TX/RX locations are supplied, the underlying report is
     generated for that path.
     """
-
     try:
         report = get_cached_propagation_report(
             tx_location=tx_location,
             rx_location=rx_location,
         )
 
-        hap = get_report_value(
+        # Use the independent HAP forecasts used by the dashboard.
+        # These contain supported_grid_points/grid_points for regional
+        # coverage rather than the raw HAP pixel support value.
+        hap = getattr(
             report,
-            "hap",
+            "hap_band_forecast",
+            None,
         )
 
         if hap is None:
@@ -462,14 +465,55 @@ def tool_get_hap_forecast(
                 ),
             }
 
+        # Add explicit regional coverage percentages for the AI.
+        # The percentage is based on the same 49-point regional grid
+        # used by the website: supported_grid_points / grid_points.
+        hap_with_coverage = {}
+
+        if isinstance(hap, dict):
+            for band, hours in hap.items():
+
+                if not isinstance(hours, dict):
+                    hap_with_coverage[band] = hours
+                    continue
+
+                band_hours = {}
+
+                for hour, prediction in hours.items():
+
+                    if not isinstance(prediction, dict):
+                        band_hours[hour] = prediction
+                        continue
+
+                    item = dict(prediction)
+
+                    supported_points = item.get(
+                        "supported_grid_points"
+                    )
+                    grid_points = item.get(
+                        "grid_points"
+                    )
+
+                    if (
+                        isinstance(supported_points, (int, float))
+                        and isinstance(grid_points, (int, float))
+                        and grid_points > 0
+                    ):
+                        item["coverage_percent"] = round(
+                            supported_points / grid_points * 100,
+                            1,
+                        )
+
+                    band_hours[hour] = item
+
+                hap_with_coverage[band] = band_hours
+
         return {
             "type": "hap_forecast",
             "status": "ok",
             "tx_location": tx_location,
             "rx_location": rx_location,
-            "data": serialize_value(
-                hap
-            ),
+            "data": serialize_value(hap_with_coverage),
         }
 
     except Exception as exc:
@@ -479,10 +523,6 @@ def tool_get_hap_forecast(
             "error": str(exc),
         }
 
-
-# ============================================================
-# AI TOOL: IONOSPHERE
-# ============================================================
 
 def tool_get_ionosphere(
     tx_location: str | None = None,
@@ -813,72 +853,6 @@ def is_explicit_grafex_request(
         for term in grafex_terms
     )
 
-
-def report_has_grafex(tool_result: Any) -> bool:
-    """
-    Determine whether a get_propagation_report tool result
-    actually contains usable GRAFEX data.
-
-    Tool results are wrapped like:
-
-    {
-        "type": "propagation_report",
-        "status": "ok",
-        "data": {
-            "grafex": ...
-        }
-    }
-    """
-
-    if not isinstance(tool_result, dict):
-        return False
-
-    if tool_result.get("status") != "ok":
-        return False
-
-    data = tool_result.get("data")
-
-    if not isinstance(data, dict):
-        return False
-
-    grafex = data.get("grafex")
-
-    if grafex is None:
-        return False
-
-    if isinstance(grafex, dict):
-
-        status = str(
-            grafex.get("status", "")
-        ).lower()
-
-        if status in {
-            "error",
-            "unavailable",
-            "failed",
-            "none",
-            "missing",
-        }:
-            return False
-
-        meaningful_keys = (
-            set(grafex.keys())
-            - {
-                "status",
-                "error",
-                "message",
-                "warning",
-            }
-        )
-
-        return bool(meaningful_keys)
-
-    if isinstance(grafex, list):
-        return len(grafex) > 0
-
-    return True
-
-
 # ============================================================
 # SYSTEM PROMPT
 # ============================================================
@@ -902,6 +876,102 @@ Use this evidence chain:
 DATA → DIRECT INTERPRETATION → ANSWER
 
 Do not make unsupported additional inferences.
+
+============================================================
+
+GRAFEX RESPONSE STYLE
+============================================================
+
+When GRAFEX data is available, do NOT automatically dump the complete
+hourly GRAFEX dataset into the answer.
+
+The default response should be a concise, useful interpretation of the
+GRAFEX prediction.
+
+For a normal GRAFEX or path-specific propagation question:
+
+- Give the TX → RX path.
+- Give the distance when available.
+- Give the T-index when available.
+- Give the primary propagation mode when available.
+- Summarize the important predicted propagation periods.
+- Explain the useful frequency/propagation ranges when they can be
+  directly supported by the returned GRAFEX data.
+- Focus on information that helps the amateur-radio operator decide
+  when or how to operate.
+- Do NOT reproduce every hourly GRAFEX row by default.
+- Do NOT reproduce the complete symbol table or legend by default.
+
+The detailed GRAFEX data remains available to you and should be used
+to produce the concise interpretation.
+
+Only provide the full hourly GRAFEX data when the user explicitly asks
+for detailed, full, complete, raw, hourly, technical, or otherwise
+in-depth GRAFEX information.
+
+Examples:
+
+User:
+"Can you make me a GRAFEX for Nelson to Mumbai?"
+
+Preferred response:
+Provide a concise GRAFEX path summary and interpretation. Do not dump
+all 24 hourly rows.
+
+User:
+"When can I contact Mumbai from Nelson?"
+
+Preferred response:
+Use the returned GRAFEX data to identify the relevant predicted UTC
+periods and explain the propagation conditions. Do not simply dump the
+raw hourly table.
+
+User:
+"What band should I use to reach Mumbai from Nelson?"
+
+Preferred response:
+Use the returned GRAFEX data to explain the predicted useful frequency
+range and relevant time periods. Do not dump the complete raw GRAFEX
+dataset.
+
+User:
+"Give me the full GRAFEX data for Nelson to Mumbai."
+
+Preferred response:
+Provide the detailed hourly GRAFEX data, including OWF, EMUF, ALF,
+frequency symbols, and the symbol legend when available.
+
+User:
+"Explain the GRAFEX for Nelson to Mumbai in detail."
+
+Preferred response:
+Give a detailed interpretation of the GRAFEX prediction and include
+the relevant technical data needed to support that explanation.
+
+IMPORTANT:
+
+Do not invent amateur-radio band mappings from GRAFEX symbol positions
+unless the returned data or verified application data explicitly
+provides that mapping.
+
+Do not treat GRAFEX model output as a guarantee that a contact will
+succeed.
+
+When discussing a predicted frequency range, distinguish between:
+- the model's predicted propagation limits/ranges,
+- amateur-radio operating bands,
+- and an actual successful contact.
+
+If the GRAFEX data does not support a precise conclusion, say so rather
+than guessing.
+
+The goal is:
+
+NORMAL QUESTION → concise operational interpretation
+
+EXPLICIT DETAILED QUESTION → detailed technical GRAFEX report
+
+============================================================
 
 For example:
 
@@ -992,6 +1062,71 @@ Use get_propagation_report for:
 
 For path-specific questions, get_propagation_report is the primary
 tool.
+
+============================================================
+3A. EXPLICIT HAP REQUESTS
+============================================================
+
+If the user explicitly mentions HAP, HAP forecast, HAP predictions,
+HAP bands, HAP transitions, or asks for HAP for a location, treat
+that as a DIRECT HAP REQUEST.
+
+Examples:
+
+"hap for Nelson"
+
+"HAP forecast for Nelson"
+
+"what does HAP say for Nelson"
+
+"show me the HAP prediction"
+
+"what bands does HAP predict"
+
+For a DIRECT HAP REQUEST:
+
+1. MUST call get_hap_forecast.
+2. Do NOT call get_propagation_report instead.
+3. Do NOT use GRAFEX instead.
+4. Do NOT use ionosphere instead.
+5. Do NOT use space weather instead.
+6. If one location is supplied, pass it as tx_location.
+7. If two locations are supplied, pass them as tx_location and
+   rx_location.
+8. Use the returned HAP data directly in the answer.
+9. If get_hap_forecast returns status="ok", do NOT say that HAP
+   is unavailable.
+10. Only say HAP is unavailable if the HAP tool actually returns
+    status="unavailable" or status="error".
+
+Examples:
+
+User:
+"hap for Nelson"
+
+Call:
+
+get_hap_forecast(
+    tx_location="Nelson, New Zealand"
+)
+
+User:
+"hap for Nelson to Sydney"
+
+Call:
+
+get_hap_forecast(
+    tx_location="Nelson, New Zealand",
+    rx_location="Sydney, Australia"
+)
+
+IMPORTANT:
+
+An explicit HAP request takes priority over the general
+get_propagation_report rule.
+
+Do not interpret the phrase "hap for Nelson" as a broad propagation
+question requiring get_propagation_report.
 
 ============================================================
 4. PATH-SPECIFIC QUESTIONS
@@ -2125,10 +2260,21 @@ def ask_radio_assistant(
                     flush=True,
                 )
 
+                data = (
+                    result.get("data")
+                    if isinstance(result, dict)
+                    else None
+                )
+
+                data_status = (
+                    data.get("data_status")
+                    if isinstance(data, dict)
+                    else None
+                )
+
                 grafex_was_returned = (
-                    report_has_grafex(
-                        result
-                    )
+                    isinstance(data_status, dict)
+                    and data_status.get("grafex_available") is True
                 )
 
                 # ------------------------------------------------
@@ -2141,6 +2287,202 @@ def ask_radio_assistant(
                 # This prevents Mistral from seeing HAP and then
                 # trying to construct a replacement answer.
                 # ------------------------------------------------
+
+                if grafex_was_returned:
+
+                    grafex = data.get("grafex")
+
+                    if isinstance(grafex, dict):
+
+                        hours = grafex.get("hours", [])
+
+                        # ------------------------------------------------
+                        # Detect an optional UTC hour range in the user's
+                        # original request.
+                        #
+                        # Examples:
+                        #   "0utc to 12utc"
+                        #   "00 utc to 12 utc"
+                        #   "from 3utc to 8utc"
+                        #
+                        # End hour is inclusive.
+                        # ------------------------------------------------
+
+                        import re
+
+                        range_match = re.search(
+                            r"(?:from\\s*)?(\\d{1,2})\\s*utc\\s*(?:to|-|through)\\s*(\\d{1,2})\\s*utc",
+                            user_message,
+                            re.IGNORECASE,
+                        )
+
+                        if range_match:
+                            start_hour = int(range_match.group(1))
+                            end_hour = int(range_match.group(2))
+
+                            if (
+                                0 <= start_hour <= 23
+                                and 0 <= end_hour <= 23
+                            ):
+                                if start_hour <= end_hour:
+                                    selected_hours = [
+                                        h
+                                        for h in hours
+                                        if isinstance(h, dict)
+                                        and start_hour <= h.get("utc_hour", -1) <= end_hour
+                                    ]
+                                else:
+                                    selected_hours = [
+                                        h
+                                        for h in hours
+                                        if isinstance(h, dict)
+                                        and (
+                                            h.get("utc_hour", -1) >= start_hour
+                                            or h.get("utc_hour", -1) <= end_hour
+                                        )
+                                    ]
+                            else:
+                                selected_hours = hours
+                        else:
+                            selected_hours = hours
+
+                        summary_lines = [
+                            "GRAFEX propagation prediction",
+                            "",
+                            f"TX: {grafex.get('tx_name', 'unknown')}",
+                            f"RX: {grafex.get('rx_name', 'unknown')}",
+                            f"Date: {grafex.get('prediction_date', 'unknown')}",
+                            f"Distance: {grafex.get('distance_km', 'unknown')} km",
+                            (
+                                "TX → RX bearing: "
+                                f"{grafex.get('bearing_tx_to_rx', 'unknown')}°"
+                            ),
+                            (
+                                "RX → TX bearing: "
+                                f"{grafex.get('bearing_rx_to_tx', 'unknown')}°"
+                            ),
+                            f"T-index: {grafex.get('t_index', 'unknown')}",
+                            (
+                                "Primary mode: "
+                                f"{grafex.get('first_mode', 'unknown')}"
+                            ),
+                            (
+                                "Secondary mode: "
+                                f"{grafex.get('second_mode', 'unknown')}"
+                            ),
+                            "",
+                            "UTC HOURLY GRAFEX DATA",
+                            "-" * 72,
+                        ]
+
+                        for hour in selected_hours:
+
+                            if not isinstance(hour, dict):
+                                continue
+
+                            utc_hour = hour.get("utc_hour")
+
+                            def fmt(value):
+                                if value is None:
+                                    return "N/A"
+                                try:
+                                    return f"{float(value):.1f}"
+                                except (TypeError, ValueError):
+                                    return str(value)
+
+                            summary_lines.append(
+                                f"{int(utc_hour):02d}:00 UTC"
+                            )
+
+                            summary_lines.append(
+                                "  First mode: "
+                                f"OWF {fmt(hour.get('first_owf_mhz'))} MHz | "
+                                f"EMUF {fmt(hour.get('first_emuf_mhz'))} MHz | "
+                                f"ALF {fmt(hour.get('first_alf_mhz'))} MHz"
+                            )
+
+                            summary_lines.append(
+                                "  Second mode: "
+                                f"OWF {fmt(hour.get('second_owf_mhz'))} MHz | "
+                                f"EMUF {fmt(hour.get('second_emuf_mhz'))} MHz | "
+                                f"ALF {fmt(hour.get('second_alf_mhz'))} MHz"
+                            )
+
+                            frequencies = hour.get("frequencies")
+
+                            if isinstance(frequencies, dict):
+                                symbols = []
+
+                                for frequency, info in sorted(
+                                    frequencies.items(),
+                                    key=lambda item: float(item[0]),
+                                ):
+                                    if not isinstance(info, dict):
+                                        continue
+
+                                    symbol = info.get("symbol", "?")
+
+                                    try:
+                                        frequency_text = f"{float(frequency):g}"
+                                    except (TypeError, ValueError):
+                                        frequency_text = str(frequency)
+
+                                    symbols.append(
+                                        f"{frequency_text}={symbol}"
+                                    )
+
+                                if symbols:
+                                    summary_lines.append(
+                                        "  Frequency symbols: "
+                                        + " ".join(symbols)
+                                    )
+
+                            summary_lines.append("")
+
+                        summary_lines.extend([
+                            "GRAFEX SYMBOL LEGEND",
+                            ". = usable less than 50% of days",
+                            "% = usable 50% to 90% of days",
+                            "B = both E and F modes 90% of days",
+                            "M = mixed first and second F modes",
+                            "F = first F mode only",
+                            "E = E-layer propagation",
+                            "P = 90% E and 50-90% F",
+                            "S = second modes only",
+                            "A = high absorption",
+                            "X = complex modes",
+                        ])
+
+                        final_answer = "\n".join(summary_lines)
+
+                    else:
+
+                        final_answer = (
+                            "GRAFEX was successfully returned for "
+                            "the requested path, but the structured "
+                            "GRAFEX data could not be formatted."
+                        )
+
+                    updated_history = [
+                        *history,
+                        {
+                            "role": "user",
+                            "content": user_message,
+                        },
+                        {
+                            "role": "assistant",
+                            "content": final_answer,
+                        },
+                    ]
+
+                    updated_history = updated_history[
+                        -MAX_HISTORY_MESSAGES:
+                    ]
+
+                    return (
+                        final_answer,
+                        updated_history,
+                    )
 
                 if not grafex_was_returned:
 
