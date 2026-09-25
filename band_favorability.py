@@ -107,6 +107,10 @@ HAP_COLOURS = {
     (0, 0, 128): 28850,       # Navy
 }
 
+# SWS uses white to represent an area where there is no HAP
+# frequency recommendation.
+HAP_EMPTY_COLOUR = (255, 255, 255)
+
 
 # ============================================================================
 # DISCOVERED MAP GEOMETRY
@@ -730,111 +734,191 @@ class HAPDecoder:
         )
 
     # ------------------------------------------------------------------------
-    # Sample point
-    # ------------------------------------------------------------------------
+# Sample point
+# ------------------------------------------------------------------------
 
-    @staticmethod
-    def sample_point(
-        panel: Image.Image,
-        point: HAPGridPoint,
-        radius: int = 2,
-    ) -> tuple[
-        Optional[int],
-        int,
-    ]:
+@staticmethod
+def sample_point(
+    panel: Image.Image,
+    point: HAPGridPoint,
+    radius: int = 2,
+) -> tuple[
+    Optional[int],
+    int,
+]:
+    """
+    Sample a small neighbourhood around a geographic point.
 
-        """
-        Sample a small neighbourhood around a geographic point.
+    The dominant HAP colour is returned.
 
-        The dominant recognised HAP colour is returned.
+    White is explicitly treated as the SWS "empty / no HAP
+    recommendation" colour.
 
-        sample_support is the number of pixels supporting that colour.
+    IMPORTANT:
 
-        This is a decoder quality metric only. It is NOT propagation
-        confidence.
-        """
+        White participates in the sample vote.
 
-        image = panel.convert(
-            "RGB"
-        )
+        This prevents a small isolated coloured pixel from being
+        interpreted as a valid HAP recommendation when the surrounding
+        area is actually empty.
 
-        centre_x = round(
-            point.pixel_x
-        )
+    Returns:
 
-        centre_y = round(
-            point.pixel_y
-        )
+        (frequency_khz, support)
 
-        counts = {}
+    Where:
 
-        for y in range(
-            centre_y - radius,
-            centre_y + radius + 1,
+        frequency_khz:
+            The selected HAP frequency, or None if the sampled area
+            is empty / has no usable HAP colour.
+
+        support:
+            Number of sampled pixels supporting the selected HAP
+            frequency.
+
+    sample_support is a decoder quality metric only.
+
+    It is NOT:
+
+        - propagation probability
+        - signal strength
+        - contact reliability
+        - percentage chance of communication
+    """
+
+    image = panel.convert(
+        "RGB"
+    )
+
+    centre_x = round(
+        point.pixel_x
+    )
+
+    centre_y = round(
+        point.pixel_y
+    )
+
+    # --------------------------------------------------------------------
+    # Count every relevant pixel.
+    #
+    # White is deliberately included because it represents the SWS
+    # "empty" state.
+    # --------------------------------------------------------------------
+
+    counts = {}
+
+    for y in range(
+        centre_y - radius,
+        centre_y + radius + 1,
+    ):
+
+        if (
+            y < 0
+            or y >= image.height
+        ):
+            continue
+
+        for x in range(
+            centre_x - radius,
+            centre_x + radius + 1,
         ):
 
             if (
-                y < 0
-                or y >= image.height
+                x < 0
+                or x >= image.width
             ):
-
                 continue
 
-            for x in range(
-                centre_x - radius,
-                centre_x + radius + 1,
-            ):
+            rgb = image.getpixel(
+                (x, y)
+            )
 
-                if (
-                    x < 0
-                    or x >= image.width
-                ):
+            # ------------------------------------------------------------
+            # Explicit SWS empty colour.
+            # ------------------------------------------------------------
 
-                    continue
+            if rgb == HAP_EMPTY_COLOUR:
 
-                rgb = image.getpixel(
-                    (x, y)
-                )
-
-                frequency = (
-                    HAP_COLOURS.get(
-                        rgb
-                    )
-                )
-
-                if frequency is None:
-
-                    continue
-
-                counts[rgb] = (
+                counts[
+                    "empty"
+                ] = (
                     counts.get(
-                        rgb,
+                        "empty",
                         0,
                     )
                     + 1
                 )
 
-        if not counts:
+                continue
 
-            return None, 0
+            # ------------------------------------------------------------
+            # Recognised HAP propagation colour.
+            # ------------------------------------------------------------
 
-        dominant_colour = max(
-            counts,
-            key=counts.get,
-        )
+            frequency = HAP_COLOURS.get(
+                rgb
+            )
 
-        frequency = (
-            HAP_COLOURS[
-                dominant_colour
-            ]
-        )
+            if frequency is not None:
 
-        return (
-            frequency,
-            counts[
-                dominant_colour
-            ],
-        )
+                counts[
+                    frequency
+                ] = (
+                    counts.get(
+                        frequency,
+                        0,
+                    )
+                    + 1
+                )
+
+                continue
+
+            # ------------------------------------------------------------
+            # Unknown colours are ignored.
+            #
+            # These may be borders, text, map features, anti-aliasing,
+            # or other rendering artefacts.
+            # ------------------------------------------------------------
+
+    # --------------------------------------------------------------------
+    # Nothing usable was sampled.
+    # --------------------------------------------------------------------
+
+    if not counts:
+        return None, 0
+
+    # --------------------------------------------------------------------
+    # Determine the dominant sampled state.
+    # --------------------------------------------------------------------
+
+    dominant_state = max(
+        counts,
+        key=counts.get,
+    )
+
+    dominant_count = counts[
+        dominant_state
+    ]
+
+    # --------------------------------------------------------------------
+    # If white / empty is dominant, there is no HAP recommendation.
+    # --------------------------------------------------------------------
+
+    if dominant_state == "empty":
+        return None, 0
+
+    # --------------------------------------------------------------------
+    # Otherwise the dominant state is a HAP frequency.
+    # --------------------------------------------------------------------
+
+    frequency = int(
+        dominant_state
+    )
+
+    return (
+        frequency,
+        dominant_count,
+    )
 
     # ------------------------------------------------------------------------
     # Decode one hour
