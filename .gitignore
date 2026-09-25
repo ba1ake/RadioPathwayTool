@@ -1,3 +1,6 @@
 .env
 /.hap_cache
 /__pycache__
+# Java/JDK installations
+java/
+*.tar.gz
