@@ -1,0 +1,251 @@
+from __future__ import annotations
+
+import time
+from dataclasses import asdict, is_dataclass
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, Request
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+from main import get_propagation_report
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+REPORT_CACHE_SECONDS = 300
+
+
+# ============================================================
+# FASTAPI
+# ============================================================
+
+app = FastAPI(
+    title="RadioPathwayTool",
+)
+
+app.mount(
+    "/static",
+    StaticFiles(directory=BASE_DIR / "static"),
+    name="static",
+)
+
+templates = Jinja2Templates(
+    directory=BASE_DIR / "templates"
+)
+
+
+# ============================================================
+# REPORT CACHE
+# ============================================================
+
+_cached_report: Any = None
+_cached_time: float = 0.0
+
+
+def get_cached_report() -> Any:
+    global _cached_report
+    global _cached_time
+
+    now = time.time()
+
+    if (
+        _cached_report is not None
+        and now - _cached_time < REPORT_CACHE_SECONDS
+    ):
+        return _cached_report
+
+    report = get_propagation_report()
+
+    _cached_report = report
+    _cached_time = now
+
+    return report
+
+
+# ============================================================
+# SERIALIZATION
+# ============================================================
+
+def serialize_value(value: Any) -> Any:
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return value.isoformat()
+
+    if isinstance(value, date):
+        return value.isoformat()
+
+    if is_dataclass(value):
+        return serialize_value(asdict(value))
+
+    if isinstance(value, dict):
+        return {
+            str(key): serialize_value(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple)):
+        return [
+            serialize_value(item)
+            for item in value
+        ]
+
+    if isinstance(value, set):
+        return [
+            serialize_value(item)
+            for item in value
+        ]
+
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
+    if hasattr(value, "model_dump"):
+        try:
+            return serialize_value(value.model_dump())
+        except Exception:
+            pass
+
+    if hasattr(value, "dict"):
+        try:
+            return serialize_value(value.dict())
+        except Exception:
+            pass
+
+    return str(value)
+
+
+def report_to_dict(report: Any) -> dict[str, Any]:
+    if report is None:
+        return {}
+
+    if is_dataclass(report):
+        data = asdict(report)
+
+    elif isinstance(report, dict):
+        data = dict(report)
+
+    elif hasattr(report, "model_dump"):
+        data = report.model_dump()
+
+    elif hasattr(report, "dict"):
+        data = report.dict()
+
+    else:
+        return {}
+
+    return serialize_value(data)
+
+
+# ============================================================
+# WEB PAGE
+# ============================================================
+
+@app.get("/")
+async def dashboard(request: Request):
+    return templates.TemplateResponse(
+        request=request,
+        name="index.html",
+        context={
+            "title": "RadioPathwayTool",
+        },
+    )
+
+
+# ============================================================
+# API
+# ============================================================
+
+@app.get("/api/status")
+async def status():
+    try:
+        report = get_cached_report()
+
+        return {
+            "status": "online",
+            "report": report_to_dict(report),
+        }
+
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": str(exc),
+        }
+
+
+@app.get("/api/propagation")
+async def propagation():
+    try:
+        report = get_cached_report()
+
+        return {
+            "status": "ok",
+            "report": report_to_dict(report),
+        }
+
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": str(exc),
+        }
+
+
+@app.get("/api/space-weather")
+async def space_weather():
+    try:
+        report = get_cached_report()
+        data = report_to_dict(report)
+
+        return {
+            "status": "ok",
+            "space_weather": data.get("space_weather"),
+        }
+
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": str(exc),
+        }
+
+
+@app.get("/api/ionosphere")
+async def ionosphere():
+    try:
+        report = get_cached_report()
+        data = report_to_dict(report)
+
+        return {
+            "status": "ok",
+            "ionosphere": data.get("ionosphere_observations"),
+        }
+
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": str(exc),
+        }
+
+
+@app.get("/api/hap")
+async def hap():
+    try:
+        report = get_cached_report()
+        data = report_to_dict(report)
+
+        return {
+            "status": "ok",
+            "hap": data.get("hap"),
+        }
+
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": str(exc),
+        }

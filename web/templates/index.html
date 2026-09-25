@@ -1,0 +1,313 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard — RadioPathwayTool{% endblock %}
+
+{% block content %}
+
+<section class="page-heading">
+    <div>
+        <h1>HF Conditions</h1>
+        <p>Current independent SWS HAP conditions</p>
+    </div>
+
+    <div class="last-update">
+        Last update:
+        <span id="last-update">Loading...</span>
+    </div>
+</section>
+
+
+<!-- =========================================================
+     INDEPENDENT BAND HAP CONDITIONS
+     ========================================================= -->
+
+<section class="band-grid">
+
+    {% for band in [
+        "160m",
+        "80m",
+        "40m",
+        "30m",
+        "20m",
+        "17m",
+        "15m",
+        "12m",
+        "10m"
+    ] %}
+
+    <div class="band-card" id="band-card-{{ band }}">
+        <div class="band-name">{{ band }}</div>
+
+        <div class="band-score" id="score-{{ band }}">
+            --/49
+        </div>
+
+        <div class="band-regional-label">
+            regional grid support
+        </div>
+
+        <div class="band-status" id="status-{{ band }}">
+            Loading
+        </div>
+
+        <div class="score-bar" aria-label="Regional HAP support">
+            <div
+                class="score-fill"
+                id="bar-{{ band }}"
+            ></div>
+        </div>
+    </div>
+
+    {% endfor %}
+
+</section>
+
+<p class="hap-note">
+    <strong>Regional:</strong> X/49 grid points where SWS independently
+    supports the selected frequency.
+    <strong>Base:</strong> whether the selected frequency is supported
+    at the Nelson transmitter location.
+    The regional figure is not a probability or communication-success percentage.
+</p>
+
+
+<!-- =========================================================
+     SPACE WEATHER + PROPAGATION
+     ========================================================= -->
+
+<section class="dashboard-grid">
+
+    <div class="panel">
+
+        <div class="panel-header">
+            <h2>☀️ Space Weather</h2>
+        </div>
+
+        <div class="weather-grid">
+
+            <div class="metric">
+                <span class="metric-label">
+                    Solar Flux
+                </span>
+
+                <span
+                    class="metric-value"
+                    id="sfi"
+                >
+                    --
+                </span>
+            </div>
+
+            <div class="metric">
+                <span class="metric-label">
+                    K Index
+                </span>
+
+                <span
+                    class="metric-value"
+                    id="k-index"
+                >
+                    --
+                </span>
+            </div>
+
+            <div class="metric">
+                <span class="metric-label">
+                    A Index
+                </span>
+
+                <span
+                    class="metric-value"
+                    id="a-index"
+                >
+                    --
+                </span>
+            </div>
+
+            <div class="metric">
+                <span class="metric-label">
+                    X-Ray
+                </span>
+
+                <span
+                    class="metric-value"
+                    id="xray"
+                >
+                    --
+                </span>
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <div class="panel">
+
+        <div class="panel-header">
+            <h2>📡 Propagation</h2>
+        </div>
+
+        <div class="path-card">
+
+            <div class="path-title">
+                <span id="tx-location">
+                    Nelson
+                </span>
+
+                →
+
+                <span id="rx-location">
+                    Australia
+                </span>
+            </div>
+
+            <div class="path-description">
+                Current SWS HAP recommendation:
+
+                <strong id="current-band">
+                    --
+                </strong>
+
+                <span id="current-frequency"></span>
+            </div>
+
+            <div class="path-description">
+                Universal HAP base-point support:
+
+                <strong id="current-support">
+                    --
+                </strong>
+            </div>
+
+            <div class="path-description">
+                Independent band tests:
+
+                <strong>
+                    See band cards above
+                </strong>
+            </div>
+
+            <button class="details-button">
+                Detailed Analysis
+            </button>
+
+        </div>
+
+    </div>
+
+</section>
+
+
+<!-- =========================================================
+     NEXT PROPAGATION WINDOW
+     ========================================================= -->
+
+<section class="panel next-window">
+
+    <div class="panel-header">
+        <h2>🔭 Next Propagation Window</h2>
+    </div>
+
+    <div class="window-content">
+
+        <div class="window-path">
+
+            <span id="next-tx-location">
+                Nelson
+            </span>
+
+            →
+
+            <span id="next-rx-location">
+                Australia
+            </span>
+
+        </div>
+
+        <div
+            class="window-band"
+            id="next-band"
+        >
+            --
+        </div>
+
+        <div
+            class="window-time"
+            id="next-transition"
+        >
+            Loading...
+        </div>
+
+        <div
+            class="window-time"
+            id="next-frequency"
+        >
+            --
+        </div>
+
+    </div>
+
+</section>
+
+
+<!-- =========================================================
+     24-HOUR UNIVERSAL HAP
+     ========================================================= -->
+
+<section class="panel hap-forecast">
+
+    <div class="panel-header">
+
+        <h2>
+            🕐 24-Hour SWS HAP Recommendation
+        </h2>
+
+        <p>
+            UTC · Nelson base-point recommendation
+        </p>
+
+    </div>
+
+    <div
+        class="hap-timeline"
+        id="hap-timeline"
+    >
+        <div class="hap-loading">
+            Loading forecast...
+        </div>
+    </div>
+
+</section>
+
+
+<!-- =========================================================
+     INDEPENDENT BAND FORECAST
+     ========================================================= -->
+
+<section class="panel hap-forecast">
+
+    <div class="panel-header">
+
+        <h2>
+            📻 24-Hour Independent Band HAP
+        </h2>
+
+        <p>
+            Each band is queried independently from SWS
+        </p>
+
+    </div>
+
+    <div
+        class="hap-band-forecast"
+        id="hap-band-forecast"
+    >
+        <div class="hap-loading">
+            Loading independent band forecasts...
+        </div>
+    </div>
+
+</section>
+
+{% endblock %}

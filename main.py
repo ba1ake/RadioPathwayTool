@@ -81,6 +81,10 @@ from band_favorability import (
     HAPConfig,
 )
 
+from band_hap import (
+    IndependentHAPCollector,
+)
+
 from propagation_engine import (
     LocationResolver,
     PropagationEngine,
@@ -199,6 +203,16 @@ class PropagationReport:
 
     regional_distribution: dict[str, int]
     hap_forecast: dict[int, dict[str, Any]]
+
+    # Independent one-frequency HAP predictions.
+    #
+    # Structure:
+    #
+    #   band -> UTC hour -> prediction data
+    #
+    # These are deliberately separate from the universal multi-frequency
+    # HAP recommendation.
+    hap_band_forecast: dict[str, dict[int, dict[str, Any]]]
 
     # -----------------------------------------------------------------------
     # Supporting data
@@ -406,6 +420,47 @@ def collect_hap(
     )
 
     return config, decoded_hap
+
+
+def collect_independent_hap(
+    config: HAPConfig,
+    current_time: datetime,
+) -> dict[str, dict[int, dict[str, Any]]]:
+    """
+    Collect independent HAP predictions for every configured band.
+
+    The collector returns:
+
+        band -> {
+            "frequency_mhz": float,
+            "hours": {
+                utc_hour -> prediction
+            }
+        }
+
+    The report expects:
+
+        band -> {
+            utc_hour -> prediction
+        }
+
+    Therefore this function unwraps the "hours" container.
+    """
+
+    collector = IndependentHAPCollector()
+
+    raw_results = collector.collect_all(
+        config=config,
+        frequencies_khz=HAP_FREQUENCIES_KHZ,
+        timestamp_utc=current_time,
+    )
+
+    results: dict[str, dict[int, dict[str, Any]]] = {}
+
+    for band, band_data in raw_results.items():
+        results[band] = band_data.get("hours", {})
+
+    return results
 
 
 def get_hap_hour(
@@ -2772,6 +2827,8 @@ def get_propagation_report(
 
     regional_distribution = {}
     hap_forecast = {}
+    hap_band_forecast = {}
+
     try:
 
         (
@@ -2855,6 +2912,49 @@ def get_propagation_report(
                 ),
             }
 
+        # ---------------------------------------------------------------
+        # Independent one-frequency HAP predictions
+        # ---------------------------------------------------------------
+        #
+        # The universal HAP above answers:
+        #
+        #     "Which supplied frequency does SWS recommend?"
+        #
+        # These requests independently test each band:
+        #
+        #     "Does SWS HAP support this frequency?"
+        #
+        # They are intentionally kept separate.
+        try:
+
+            hap_band_forecast = collect_independent_hap(
+                config=config,
+                current_time=current_time,
+            )
+
+        except Exception as exc:
+
+            hap_band_forecast = {
+                band: {
+                    24: {
+                        "error": (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    }
+                }
+                for band in (
+                    "160m",
+                    "80m",
+                    "40m",
+                    "30m",
+                    "20m",
+                    "17m",
+                    "15m",
+                    "12m",
+                    "10m",
+                )
+            }
+
     except Exception as exc:
 
         status.hap_available = False
@@ -2933,6 +3033,10 @@ def get_propagation_report(
 
         hap_forecast=(
             hap_forecast
+        ),
+
+        hap_band_forecast=(
+            hap_band_forecast
         ),
 
         # Supporting data

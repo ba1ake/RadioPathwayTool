@@ -1,2 +1,3 @@
 .env
 /.hap_cache
+/__pycache__

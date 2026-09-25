@@ -1,15 +1,11 @@
-from __future__ import annotations
-
 import asyncio
 import os
 import time
-from typing import Any
 
 import discord
 from dotenv import load_dotenv
 
 from main import get_propagation_report
-from ai_assistant import ask_radio_assistant
 
 
 # ============================================================
@@ -18,120 +14,58 @@ from ai_assistant import ask_radio_assistant
 
 load_dotenv()
 
-DISCORD_BOT_TOKEN = os.getenv(
-    "DISCORD_BOT_TOKEN"
-)
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
-if not DISCORD_BOT_TOKEN:
+CACHE_SECONDS = 300  # 5 minutes
+
+
+# ============================================================
+# TOKEN CHECK
+# ============================================================
+
+if not TOKEN:
     raise RuntimeError(
         "DISCORD_BOT_TOKEN is not set. "
-        "Add it to your .env file."
+        "Check your .env file."
     )
 
 
 # ============================================================
-# CACHE
+# DISCORD SETUP
 # ============================================================
 
-CACHE_SECONDS = 300
+intents = discord.Intents.default()
+intents.message_content = True
 
-cached_report: Any | None = None
-cached_report_time: float = 0.0
+client = discord.Client(intents=intents)
+
+
+# ============================================================
+# REPORT CACHE
+# ============================================================
+
+cached_report = None
+cached_report_time = 0
 
 report_lock = asyncio.Lock()
 
 
-# ============================================================
-# AI CONVERSATION MEMORY
-# ============================================================
-
-# Conversation history is kept separately for each:
-#
-#     guild + channel + user
-#
-# This prevents one user's conversation from leaking into
-# another user's conversation.
-conversation_history: dict[
-    tuple[int, int, int],
-    list[dict[str, Any]],
-] = {}
-
-MAX_HISTORY_MESSAGES = 10
-
-
-# ============================================================
-# DISCORD CLIENT
-# ============================================================
-
-intents = discord.Intents.default()
-
-# Required for reading normal Discord messages.
-intents.message_content = True
-
-client = discord.Client(
-    intents=intents
-)
-
-
-# ============================================================
-# GENERAL HELPERS
-# ============================================================
-
-def get_value(
-    obj: Any,
-    key: str,
-    default: Any = None,
-) -> Any:
+async def get_cached_report():
     """
-    Read a value from either a dictionary or an object.
+    Get a propagation report.
 
-    main.py currently contains a mixture of structured data
-    and dictionaries, so this keeps the Discord layer robust.
-    """
-
-    if isinstance(obj, dict):
-        return obj.get(
-            key,
-            default,
-        )
-
-    return getattr(
-        obj,
-        key,
-        default,
-    )
-
-
-def format_value(
-    value: Any,
-    default: str = "N/A",
-) -> str:
-    """
-    Convert None/empty values into a Discord-friendly string.
-    """
-
-    if value is None:
-        return default
-
-    return str(value)
-
-
-# ============================================================
-# PROPAGATION REPORT CACHE
-# ============================================================
-
-async def get_cached_report() -> Any:
-    """
-    Return the current propagation report.
-
-    The expensive report generation runs in a worker thread so
-    it does not block the Discord event loop.
+    Reports are cached for CACHE_SECONDS so multiple Discord
+    commands don't repeatedly hammer the HAP/SWS services.
     """
 
     global cached_report
     global cached_report_time
 
-    now = time.monotonic()
+    now = time.time()
+
+    # --------------------------------------------------------
+    # Return cached report if still valid
+    # --------------------------------------------------------
 
     if (
         cached_report is not None
@@ -139,10 +73,13 @@ async def get_cached_report() -> Any:
     ):
         return cached_report
 
+    # --------------------------------------------------------
+    # Prevent multiple simultaneous reports
+    # --------------------------------------------------------
+
     async with report_lock:
 
-        # Check again after acquiring the lock.
-        now = time.monotonic()
+        now = time.time()
 
         if (
             cached_report is not None
@@ -150,230 +87,433 @@ async def get_cached_report() -> Any:
         ):
             return cached_report
 
+        # ----------------------------------------------------
+        # Run blocking propagation code in another thread
+        # ----------------------------------------------------
+
         report = await asyncio.to_thread(
             get_propagation_report
         )
 
         cached_report = report
-        cached_report_time = time.monotonic()
+        cached_report_time = time.time()
 
         return report
 
 
 # ============================================================
-# LONG MESSAGE HANDLING
+# MESSAGE HELPER
 # ============================================================
 
 async def send_long_message(
-    destination: Any,
-    text: str,
-) -> None:
+    channel,
+    text,
+    limit=1900,
+):
     """
-    Discord messages have a 2000-character limit.
+    Discord has a 2000 character message limit.
 
-    Split long responses at newline boundaries where possible.
+    Split long text into multiple messages.
     """
 
-    if not text:
+    if len(text) <= limit:
+
+        await channel.send(text)
         return
 
-    max_length = 1900
+    while text:
 
-    if len(text) <= max_length:
-        await destination.send(text)
-        return
+        chunk = text[:limit]
 
-    remaining = text
+        # Try to split at a newline
+        split_at = chunk.rfind("\n")
 
-    while remaining:
+        if split_at > 500:
 
-        if len(remaining) <= max_length:
-            await destination.send(
-                remaining
-            )
-            break
+            chunk = chunk[:split_at]
 
-        split_at = remaining.rfind(
-            "\n",
-            0,
-            max_length,
-        )
+        await channel.send(chunk)
 
-        if split_at <= 0:
-            split_at = max_length
-
-        chunk = remaining[:split_at]
-
-        await destination.send(
-            chunk
-        )
-
-        remaining = remaining[
-            split_at:
-        ].lstrip("\n")
+        text = text[len(chunk):]
 
 
 # ============================================================
-# EMBED HELPERS
+# PROPAGATION EMBED
 # ============================================================
 
-def build_propagation_embed(
-    report: Any,
-) -> discord.Embed:
+def build_propagation_embed(report):
 
     embed = discord.Embed(
-        title="📡 RadioPathwayTool",
+        title="📡 HF Propagation",
         description=(
-            "Current HF propagation conditions"
+            f"**{report.location_name}**\n"
+            f"{report.generated_local.strftime('%d %b %Y %H:%M')} NZ"
         ),
     )
 
-    hap = get_value(
-        report,
-        "hap",
-        {},
-    )
+    # --------------------------------------------------------
+    # HAP
+    # --------------------------------------------------------
 
-    current = get_value(
-        hap,
-        "current_recommendation",
-        None,
-    )
+    if (
+        report.data_status
+        and report.data_status.hap_available
+    ):
 
-    next_transition = get_value(
-        hap,
-        "next_transition",
-        None,
-    )
+        if report.current_band:
 
-    regional = get_value(
-        hap,
-        "regional_distribution",
-        None,
-    )
+            if report.current_frequency_mhz:
 
-    if current is not None:
+                current_text = (
+                    f"**{report.current_band}** "
+                    f"({report.current_frequency_mhz:.3f} MHz)"
+                )
+
+            else:
+
+                current_text = (
+                    f"**{report.current_band}**"
+                )
+
+            if report.current_support is not None:
+
+                current_text += (
+                    f"\nRegional support: "
+                    f"{report.current_support}"
+                )
+
+        else:
+
+            current_text = "No current HAP recommendation."
+
+        # ----------------------------------------------------
+        # Next transition
+        # ----------------------------------------------------
+
+        if report.next_transition_utc is not None:
+
+            if report.next_transition_frequency_mhz:
+
+                next_text = (
+                    f"{report.next_transition_utc:02d} UTC → "
+                    f"**{report.next_transition_band}** "
+                    f"({report.next_transition_frequency_mhz:.3f} MHz)"
+                )
+
+            else:
+
+                next_text = (
+                    f"{report.next_transition_utc:02d} UTC → "
+                    f"**{report.next_transition_band}**"
+                )
+
+            current_text += (
+                f"\nNext change: {next_text}"
+            )
+
         embed.add_field(
-            name="Current HAP",
-            value=str(current),
+            name="🛰️ HAP",
+            value=current_text,
             inline=False,
         )
 
-    if next_transition is not None:
+    else:
+
+        hap_error = (
+            report.data_status.hap_error
+            if report.data_status
+            else "Unknown error"
+        )
+
         embed.add_field(
-            name="Next transition",
-            value=str(next_transition),
+            name="🛰️ HAP",
+            value=(
+                "❌ HAP data unavailable.\n"
+                f"```text\n{hap_error}\n```"
+            ),
             inline=False,
         )
 
-    if regional is not None:
-        embed.add_field(
-            name="Regional HAP",
-            value=str(regional),
-            inline=False,
+    # --------------------------------------------------------
+    # Ionosphere
+    # --------------------------------------------------------
+
+    if (
+        report.data_status
+        and report.data_status.ionosphere_available
+    ):
+
+        observations = (
+            report.ionosphere_observations
+            or {}
         )
 
-    embed.set_footer(
-        text="HAP is a prediction, not a guarantee of contact."
+        # Prioritise useful non-normal observations
+        interesting = []
+
+        for observation in observations.values():
+
+            condition = getattr(
+                observation,
+                "condition",
+                "",
+            )
+
+            percent = getattr(
+                observation,
+                "percent_difference",
+                None,
+            )
+
+            station_name = getattr(
+                observation,
+                "station_name",
+                "Unknown",
+            )
+
+            if (
+                percent is not None
+                and abs(percent) >= 10
+            ):
+
+                if percent > 0:
+
+                    text = (
+                        f"{station_name}: "
+                        f"{condition} "
+                        f"(+{percent:.0f}%)"
+                    )
+
+                else:
+
+                    text = (
+                        f"{station_name}: "
+                        f"{condition} "
+                        f"({percent:.0f}%)"
+                    )
+
+                interesting.append(text)
+
+        if interesting:
+
+            iono_text = "\n".join(
+                interesting[:8]
+            )
+
+        else:
+
+            iono_text = (
+                "No significant deviations reported."
+            )
+
+    else:
+
+        error = (
+            report.data_status.ionosphere_error
+            if report.data_status
+            else "Unknown error"
+        )
+
+        iono_text = (
+            "❌ Ionosphere data unavailable.\n"
+            f"`{error}`"
+        )
+
+    embed.add_field(
+        name="🌐 Ionosphere",
+        value=iono_text,
+        inline=False,
+    )
+
+    # --------------------------------------------------------
+    # Space Weather
+    # --------------------------------------------------------
+
+    if (
+        report.data_status
+        and report.data_status.space_weather_available
+    ):
+
+        sw = report.space_weather
+
+        lines = []
+
+        solar_flux = getattr(
+            sw,
+            "solar_flux_10_7",
+            None,
+        )
+
+        sunspots = getattr(
+            sw,
+            "sunspot_number",
+            None,
+        )
+
+        planetary_k = getattr(
+            sw,
+            "planetary_k_index",
+            None,
+        )
+
+        australian_k = getattr(
+            sw,
+            "australian_k_index",
+            None,
+        )
+
+        if solar_flux is not None:
+
+            lines.append(
+                f"Solar flux: **{solar_flux}**"
+            )
+
+        if sunspots is not None:
+
+            lines.append(
+                f"Sunspots: **{sunspots}**"
+            )
+
+        if planetary_k is not None:
+
+            lines.append(
+                f"Planetary K: **{planetary_k}**"
+            )
+
+        if australian_k is not None:
+
+            lines.append(
+                f"Australian K: **{australian_k}**"
+            )
+
+        if not lines:
+
+            lines.append(
+                "No summary values available."
+            )
+
+        space_text = "\n".join(lines)
+
+    else:
+
+        error = (
+            report.data_status.space_weather_error
+            if report.data_status
+            else "Unknown error"
+        )
+
+        space_text = (
+            "❌ Space weather unavailable.\n"
+            f"`{error}`"
+        )
+
+    embed.add_field(
+        name="☀️ Space Weather",
+        value=space_text,
+        inline=False,
     )
 
     return embed
 
 
-def build_ionosphere_embed(
-    report: Any,
-) -> discord.Embed:
+# ============================================================
+# IONOSPHERE EMBED
+# ============================================================
+
+def build_ionosphere_embed(report):
 
     embed = discord.Embed(
         title="🌐 Ionosphere",
         description=(
-            "Current Australian Space Weather Services "
-            "ionospheric observations"
+            f"Australian SWS observations\n"
+            f"{report.generated_local.strftime('%d %b %Y %H:%M')} NZ"
         ),
     )
 
-    ionosphere = get_value(
-        report,
-        "ionosphere",
-        [],
+    if not (
+        report.data_status
+        and report.data_status.ionosphere_available
+    ):
+
+        error = (
+            report.data_status.ionosphere_error
+            if report.data_status
+            else "Unknown error"
+        )
+
+        embed.description += (
+            f"\n\n❌ Data unavailable.\n"
+            f"```text\n{error}\n```"
+        )
+
+        return embed
+
+    observations = (
+        report.ionosphere_observations
+        or {}
     )
 
-    if isinstance(
-        ionosphere,
-        dict,
-    ):
-        # Some implementations may return a wrapper dictionary.
-        observations = ionosphere.get(
-            "observations",
-            ionosphere,
+    lines = []
+
+    for observation in observations.values():
+
+        station_name = getattr(
+            observation,
+            "station_name",
+            "Unknown",
         )
-    else:
-        observations = ionosphere
 
-    lines: list[str] = []
-
-    if isinstance(
-        observations,
-        dict,
-    ):
-        iterable = observations.items()
-    else:
-        iterable = []
-
-        if isinstance(
-            observations,
-            list,
-        ):
-            iterable = [
-                (
-                    get_value(
-                        item,
-                        "station",
-                        "Station",
-                    ),
-                    item,
-                )
-                for item in observations
-            ]
-
-    for station, observation in iterable:
-
-        condition = get_value(
+        condition = getattr(
             observation,
             "condition",
-            None,
+            "unknown",
         )
 
-        percent = get_value(
+        percent = getattr(
             observation,
             "percent_difference",
             None,
         )
 
         if percent is not None:
-            lines.append(
-                f"**{station}:** "
-                f"{condition} ({percent:+.0f}%)"
-            )
-        else:
-            lines.append(
-                f"**{station}:** "
-                f"{format_value(condition)}"
-            )
 
-    if not lines:
+            if percent > 0:
+
+                condition_text = (
+                    f"{condition} "
+                    f"(+{percent:.0f}%)"
+                )
+
+            else:
+
+                condition_text = (
+                    f"{condition} "
+                    f"({percent:.0f}%)"
+                )
+
+        else:
+
+            condition_text = condition
+
         lines.append(
-            "No ionospheric observations available."
+            f"**{station_name}** — {condition_text}"
         )
 
+    if not lines:
+
+        lines.append(
+            "No observations available."
+        )
+
+    # Discord embed field limit
     text = "\n".join(lines)
 
-    # Keep embed field under Discord's 1024-character limit.
-    if len(text) > 1000:
-        text = text[:997] + "..."
+    if len(text) > 1024:
+
+        text = text[:1000] + "..."
 
     embed.add_field(
-        name="Observations",
+        name="Stations",
         value=text,
         inline=False,
     )
@@ -381,230 +521,253 @@ def build_ionosphere_embed(
     return embed
 
 
-def build_space_weather_embed(
-    report: Any,
-) -> discord.Embed:
+# ============================================================
+# SPACE WEATHER EMBED
+# ============================================================
+
+def build_space_weather_embed(report):
 
     embed = discord.Embed(
         title="☀️ Space Weather",
         description=(
-            "Current solar and geomagnetic conditions"
+            f"{report.generated_local.strftime('%d %b %Y %H:%M')} NZ"
         ),
     )
 
-    sw = get_value(
-        report,
-        "space_weather",
-        {},
-    )
+    if not (
+        report.data_status
+        and report.data_status.space_weather_available
+    ):
 
-    f107 = get_value(
-        sw,
-        "solar_flux_10_7",
-        None,
-    )
+        error = (
+            report.data_status.space_weather_error
+            if report.data_status
+            else "Unknown error"
+        )
 
-    sunspots = get_value(
-        sw,
-        "sunspot_number",
-        None,
-    )
+        embed.add_field(
+            name="Status",
+            value=(
+                "❌ Data unavailable.\n"
+                f"```text\n{error}\n```"
+            ),
+            inline=False,
+        )
 
-    planetary_k = get_value(
-        sw,
-        "planetary_k_index",
-        None,
-    )
+        return embed
 
-    australian_k = get_value(
-        sw,
-        "australian_k_index",
-        None,
-    )
+    sw = report.space_weather
 
-    a_index = get_value(
-        sw,
-        "a_index",
-        None,
-    )
-
-    dst = get_value(
-        sw,
-        "dst_index",
-        None,
-    )
-
-    embed.add_field(
-        name="Solar",
-        value=(
-            f"F10.7: {format_value(f107)}\n"
-            f"Sunspots: {format_value(sunspots)}"
+    fields = [
+        (
+            "Solar Flux (F10.7)",
+            getattr(
+                sw,
+                "solar_flux_10_7",
+                None,
+            ),
         ),
-        inline=True,
-    )
-
-    embed.add_field(
-        name="Geomagnetic",
-        value=(
-            f"Planetary K: {format_value(planetary_k)}\n"
-            f"Australian K: {format_value(australian_k)}\n"
-            f"A-index: {format_value(a_index)}\n"
-            f"Dst: {format_value(dst)}"
+        (
+            "Sunspot Number",
+            getattr(
+                sw,
+                "sunspot_number",
+                None,
+            ),
         ),
-        inline=True,
-    )
+        (
+            "Planetary K",
+            getattr(
+                sw,
+                "planetary_k_index",
+                None,
+            ),
+        ),
+        (
+            "Australian K",
+            getattr(
+                sw,
+                "australian_k_index",
+                None,
+            ),
+        ),
+        (
+            "A-index",
+            getattr(
+                sw,
+                "a_index",
+                None,
+            ),
+        ),
+        (
+            "Dst",
+            getattr(
+                sw,
+                "dst_index",
+                None,
+            ),
+        ),
+    ]
 
-    alerts = get_value(
+    for name, value in fields:
+
+        if value is not None:
+
+            embed.add_field(
+                name=name,
+                value=str(value),
+                inline=True,
+            )
+
+    # --------------------------------------------------------
+    # Alerts
+    # --------------------------------------------------------
+
+    alerts = getattr(
         sw,
         "active_alerts",
-        [],
+        None,
     )
 
-    warnings = get_value(
+    warnings = getattr(
         sw,
         "active_warnings",
-        [],
+        None,
     )
 
     if alerts:
-        lines = []
-
-        for alert in alerts:
-
-            if isinstance(
-                alert,
-                dict,
-            ):
-                message = (
-                    alert.get("message")
-                    or alert.get("text")
-                    or str(alert)
-                )
-            else:
-                message = str(alert)
-
-            lines.append(
-                f"• {message}"
-            )
-
-        alert_text = "\n".join(lines)
-
-        if len(alert_text) > 1000:
-            alert_text = (
-                alert_text[:997]
-                + "..."
-            )
 
         embed.add_field(
-            name="Current watches / alerts",
-            value=alert_text,
+            name="🚨 Alerts",
+            value="\n".join(
+                str(x) for x in alerts
+            )[:1024],
             inline=False,
         )
 
     if warnings:
-        lines = []
-
-        for warning in warnings:
-
-            if isinstance(
-                warning,
-                dict,
-            ):
-                message = (
-                    warning.get("message")
-                    or warning.get("text")
-                    or str(warning)
-                )
-            else:
-                message = str(warning)
-
-            lines.append(
-                f"• {message}"
-            )
-
-        warning_text = "\n".join(lines)
-
-        if len(warning_text) > 1000:
-            warning_text = (
-                warning_text[:997]
-                + "..."
-            )
 
         embed.add_field(
-            name="Warnings",
-            value=warning_text,
+            name="⚠️ Warnings",
+            value="\n".join(
+                str(x) for x in warnings
+            )[:1024],
             inline=False,
         )
 
     return embed
 
 
-def build_status_embed(
-    report: Any,
-) -> discord.Embed:
+# ============================================================
+# STATUS EMBED
+# ============================================================
+
+def build_status_embed(report):
+
+    status = report.data_status
 
     embed = discord.Embed(
         title="🩺 RadioPathwayTool Status",
-    )
-
-    hap = get_value(
-        report,
-        "hap",
-        None,
-    )
-
-    ionosphere = get_value(
-        report,
-        "ionosphere",
-        None,
-    )
-
-    space_weather = get_value(
-        report,
-        "space_weather",
-        None,
-    )
-
-    embed.add_field(
-        name="HAP",
-        value=(
-            "✅ Available"
-            if hap is not None
-            else "❌ Unavailable"
+        description=(
+            f"Location: **{report.location_name}**\n"
+            f"Generated: "
+            f"{report.generated_local.strftime('%d %b %Y %H:%M')} NZ"
         ),
-        inline=True,
     )
 
-    embed.add_field(
-        name="Ionosphere",
-        value=(
-            "✅ Available"
-            if ionosphere is not None
-            else "❌ Unavailable"
-        ),
-        inline=True,
-    )
+    if status is None:
 
-    embed.add_field(
-        name="Space weather",
-        value=(
-            "✅ Available"
-            if space_weather is not None
-            else "❌ Unavailable"
-        ),
-        inline=True,
-    )
-
-    retrieved = get_value(
-        space_weather,
-        "retrieved_utc",
-        None,
-    )
-
-    if retrieved:
         embed.add_field(
-            name="Space-weather retrieval",
-            value=str(retrieved),
+            name="Status",
+            value="❓ No status information.",
+            inline=False,
+        )
+
+        return embed
+
+    # --------------------------------------------------------
+    # HAP
+    # --------------------------------------------------------
+
+    if status.hap_available:
+
+        hap_status = "🟢 Available"
+
+    else:
+
+        hap_status = "🔴 Unavailable"
+
+    # --------------------------------------------------------
+    # Ionosphere
+    # --------------------------------------------------------
+
+    if status.ionosphere_available:
+
+        iono_status = "🟢 Available"
+
+    else:
+
+        iono_status = "🔴 Unavailable"
+
+    # --------------------------------------------------------
+    # Space Weather
+    # --------------------------------------------------------
+
+    if status.space_weather_available:
+
+        sw_status = "🟢 Available"
+
+    else:
+
+        sw_status = "🔴 Unavailable"
+
+    embed.add_field(
+        name="🛰️ HAP",
+        value=hap_status,
+        inline=True,
+    )
+
+    embed.add_field(
+        name="🌐 Ionosphere",
+        value=iono_status,
+        inline=True,
+    )
+
+    embed.add_field(
+        name="☀️ Space Weather",
+        value=sw_status,
+        inline=True,
+    )
+
+    # --------------------------------------------------------
+    # Errors
+    # --------------------------------------------------------
+
+    errors = []
+
+    if status.hap_error:
+
+        errors.append(
+            f"HAP: {status.hap_error}"
+        )
+
+    if status.ionosphere_error:
+
+        errors.append(
+            f"Ionosphere: {status.ionosphere_error}"
+        )
+
+    if status.space_weather_error:
+
+        errors.append(
+            f"Space weather: {status.space_weather_error}"
+        )
+
+    if errors:
+
+        embed.add_field(
+            name="Errors",
+            value="\n".join(errors)[:1024],
             inline=False,
         )
 
@@ -612,196 +775,57 @@ def build_status_embed(
 
 
 # ============================================================
-# HELP
-# ============================================================
-
-def build_help_text() -> str:
-
-    return """
-**📡 RadioPathwayTool Commands**
-
-`$prop`
-Current propagation overview.
-
-`$hap`
-Current HAP forecast and regional distribution.
-
-`$ionosphere`
-Current ionospheric observations.
-
-`$spaceweather`
-Current solar and geomagnetic conditions.
-
-`$status`
-Data-source health/status.
-
-`$help`
-Show this help.
-
-**🤖 Natural language**
-
-You can also just ask me questions normally.
-
-Examples:
-
-> What's propagation like right now?
-
-> Is 80m worth trying tonight?
-
-> What's happening with the ionosphere?
-
-> Why is 160m being recommended?
-
-> What are the current geomagnetic conditions?
-
-> How might the current conditions affect 20m?
-
-The AI uses the RadioPathwayTool data rather than inventing
-current propagation conditions.
-""".strip()
-
-
-# ============================================================
-# AI QUESTION HANDLER
-# ============================================================
-
-async def handle_ai_question(
-    message: discord.Message,
-) -> None:
-
-    # Don't respond to bots.
-    if message.author.bot:
-        return
-
-    # Conversation key.
-    #
-    # guild_id can be None for DMs, so convert it to 0.
-    guild_id = (
-        message.guild.id
-        if message.guild
-        else 0
-    )
-
-    channel_id = message.channel.id
-    user_id = message.author.id
-
-    conversation_key = (
-        guild_id,
-        channel_id,
-        user_id,
-    )
-
-    history = conversation_history.get(
-        conversation_key,
-        [],
-    )
-
-    # Show that the bot is working.
-    thinking_message = await message.channel.send(
-        "🤖 Thinking..."
-    )
-
-    try:
-
-        answer, updated_history = await asyncio.to_thread(
-            ask_radio_assistant,
-            message.content,
-            history,
-        )
-
-        conversation_history[
-            conversation_key
-        ] = updated_history[-MAX_HISTORY_MESSAGES:]
-
-        await thinking_message.delete()
-
-        await send_long_message(
-            message.channel,
-            answer,
-        )
-
-    except Exception as exc:
-
-        print(
-            "AI assistant error:",
-            repr(exc),
-        )
-
-        error_text = (
-            "⚠️ I couldn't process that question "
-            "right now.\n\n"
-            f"`{type(exc).__name__}: {exc}`"
-        )
-
-        try:
-            await thinking_message.edit(
-                content=error_text
-            )
-        except Exception:
-            await send_long_message(
-                message.channel,
-                error_text,
-            )
-
-
-# ============================================================
-# READY EVENT
+# BOT READY
 # ============================================================
 
 @client.event
 async def on_ready():
 
     print(
-        f"Logged in as "
-        f"{client.user} "
-        f"(ID: {client.user.id})"
+        f"We have logged in as "
+        f"{client.user}"
     )
 
     print(
-        f"Connected to {len(client.guilds)} guild(s)."
+        f"Bot ID: {client.user.id}"
     )
 
-    activity = discord.Game(
-        name="$help | HF propagation"
+    print(
+        f"Connected to {len(client.guilds)} guild(s)"
     )
 
     await client.change_presence(
-        activity=activity
+        activity=discord.Activity(
+            type=discord.ActivityType.listening,
+            name="$help | HF propagation",
+        )
     )
 
 
 # ============================================================
-# MESSAGE EVENT
+# MESSAGE HANDLER
 # ============================================================
 
 @client.event
-async def on_message(
-    message: discord.Message,
-):
+async def on_message(message):
 
-    # Never respond to ourselves or other bots.
-    if message.author.bot:
+    # Ignore ourselves
+    if message.author == client.user:
         return
 
     content = message.content.strip()
 
-    if not content:
-        return
-
-    lower = content.lower()
-
     # ========================================================
-    # BASIC COMMANDS
+    # HELLO
     # ========================================================
 
-    if lower in {
+    if content.lower() in (
         "$hello",
         "$hi",
-    }:
+    ):
 
         await message.channel.send(
-            f"Hello {message.author.mention}! "
-            "📡 Ask me a propagation question or use `$help`."
+            f"Hello {message.author.mention}! 👋"
         )
 
         return
@@ -810,13 +834,36 @@ async def on_message(
     # HELP
     # ========================================================
 
-    if lower in {
+    if content.lower() in (
         "$help",
         "$commands",
-    }:
+    ):
 
-        await message.channel.send(
-            build_help_text()
+        help_text = (
+            "**📡 RadioPathwayTool Commands**\n\n"
+
+            "`$prop`\n"
+            "Current HF propagation report.\n\n"
+
+            "`$hap`\n"
+            "Current HAP propagation recommendation.\n\n"
+
+            "`$ionosphere`\n"
+            "Current Australian SWS ionosphere observations.\n\n"
+
+            "`$spaceweather`\n"
+            "Current solar and geomagnetic conditions.\n\n"
+
+            "`$status`\n"
+            "Show data-source availability and errors.\n\n"
+
+            "`$hello`\n"
+            "Say hello to the bot.\n"
+        )
+
+        await send_long_message(
+            message.channel,
+            help_text,
         )
 
         return
@@ -825,12 +872,16 @@ async def on_message(
     # PROPAGATION
     # ========================================================
 
-    if lower in {
+    if content.lower() in (
         "$prop",
         "$propagation",
         "$radio",
         "$conditions",
-    }:
+    ):
+
+        status_message = await message.channel.send(
+            "📡 Collecting propagation data..."
+        )
 
         try:
 
@@ -840,19 +891,20 @@ async def on_message(
                 report
             )
 
-            await message.channel.send(
-                embed=embed
+            await status_message.edit(
+                content=None,
+                embed=embed,
             )
 
         except Exception as exc:
 
-            print(
-                "Propagation command error:",
-                repr(exc),
-            )
-
-            await message.channel.send(
-                "❌ Failed to retrieve propagation data."
+            await status_message.edit(
+                content=(
+                    "❌ Failed to generate propagation report.\n"
+                    f"```text\n"
+                    f"{type(exc).__name__}: {exc}"
+                    f"\n```"
+                )
             )
 
         return
@@ -861,32 +913,59 @@ async def on_message(
     # HAP
     # ========================================================
 
-    if lower in {
+    if content.lower() in (
         "$hap",
         "$forecast",
-    }:
+    ):
+
+        status_message = await message.channel.send(
+            "🛰️ Collecting HAP forecast..."
+        )
 
         try:
 
             report = await get_cached_report()
 
+            if not (
+                report.data_status
+                and report.data_status.hap_available
+            ):
+
+                error = (
+                    report.data_status.hap_error
+                    if report.data_status
+                    else "Unknown error"
+                )
+
+                await status_message.edit(
+                    content=(
+                        "❌ HAP data is currently unavailable.\n"
+                        f"```text\n"
+                        f"{error}"
+                        f"\n```"
+                    )
+                )
+
+                return
+
             embed = build_propagation_embed(
                 report
             )
 
-            await message.channel.send(
-                embed=embed
+            await status_message.edit(
+                content=None,
+                embed=embed,
             )
 
         except Exception as exc:
 
-            print(
-                "HAP command error:",
-                repr(exc),
-            )
-
-            await message.channel.send(
-                "❌ Failed to retrieve HAP data."
+            await status_message.edit(
+                content=(
+                    "❌ Failed to collect HAP data.\n"
+                    f"```text\n"
+                    f"{type(exc).__name__}: {exc}"
+                    f"\n```"
+                )
             )
 
         return
@@ -895,10 +974,14 @@ async def on_message(
     # IONOSPHERE
     # ========================================================
 
-    if lower in {
+    if content.lower() in (
         "$ionosphere",
         "$iono",
-    }:
+    ):
+
+        status_message = await message.channel.send(
+            "🌐 Collecting ionosphere data..."
+        )
 
         try:
 
@@ -908,19 +991,20 @@ async def on_message(
                 report
             )
 
-            await message.channel.send(
-                embed=embed
+            await status_message.edit(
+                content=None,
+                embed=embed,
             )
 
         except Exception as exc:
 
-            print(
-                "Ionosphere command error:",
-                repr(exc),
-            )
-
-            await message.channel.send(
-                "❌ Failed to retrieve ionosphere data."
+            await status_message.edit(
+                content=(
+                    "❌ Failed to collect ionosphere data.\n"
+                    f"```text\n"
+                    f"{type(exc).__name__}: {exc}"
+                    f"\n```"
+                )
             )
 
         return
@@ -929,11 +1013,15 @@ async def on_message(
     # SPACE WEATHER
     # ========================================================
 
-    if lower in {
+    if content.lower() in (
         "$spaceweather",
         "$space",
         "$solar",
-    }:
+    ):
+
+        status_message = await message.channel.send(
+            "☀️ Collecting space weather data..."
+        )
 
         try:
 
@@ -943,19 +1031,20 @@ async def on_message(
                 report
             )
 
-            await message.channel.send(
-                embed=embed
+            await status_message.edit(
+                content=None,
+                embed=embed,
             )
 
         except Exception as exc:
 
-            print(
-                "Space-weather command error:",
-                repr(exc),
-            )
-
-            await message.channel.send(
-                "❌ Failed to retrieve space-weather data."
+            await status_message.edit(
+                content=(
+                    "❌ Failed to collect space weather data.\n"
+                    f"```text\n"
+                    f"{type(exc).__name__}: {exc}"
+                    f"\n```"
+                )
             )
 
         return
@@ -964,10 +1053,14 @@ async def on_message(
     # STATUS
     # ========================================================
 
-    if lower in {
+    if content.lower() in (
         "$status",
         "$health",
-    }:
+    ):
+
+        status_message = await message.channel.send(
+            "🩺 Checking RadioPathwayTool..."
+        )
 
         try:
 
@@ -977,52 +1070,38 @@ async def on_message(
                 report
             )
 
-            await message.channel.send(
-                embed=embed
+            await status_message.edit(
+                content=None,
+                embed=embed,
             )
 
         except Exception as exc:
 
-            print(
-                "Status command error:",
-                repr(exc),
-            )
-
-            await message.channel.send(
-                "❌ Failed to retrieve system status."
+            await status_message.edit(
+                content=(
+                    "❌ Failed to check system status.\n"
+                    f"```text\n"
+                    f"{type(exc).__name__}: {exc}"
+                    f"\n```"
+                )
             )
 
         return
 
     # ========================================================
-    # UNKNOWN $ COMMAND
+    # UNKNOWN COMMAND
     # ========================================================
 
     if content.startswith("$"):
 
         await message.channel.send(
             "❓ Unknown command. "
-            "Use `$help` to see available commands, "
-            "or ask me a normal question."
+            "Use `$help` to see available commands."
         )
-
-        return
-
-    # ========================================================
-    # NATURAL LANGUAGE
-    # ========================================================
-
-    await handle_ai_question(
-        message
-    )
 
 
 # ============================================================
 # START BOT
 # ============================================================
 
-if __name__ == "__main__":
-
-    client.run(
-        DISCORD_BOT_TOKEN
-    )
+client.run(TOKEN)

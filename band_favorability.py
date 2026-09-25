@@ -1,5 +1,7 @@
+
 """
 RadioPathwayTool
+
 SWS HAP propagation engine
 
 This module retrieves and decodes the Australian Bureau of Meteorology
@@ -96,20 +98,22 @@ FREQUENCY_TO_BAND = {
 # ============================================================================
 
 # These are the exact RGB colours used by the SWS HAP GIFs.
+
 HAP_COLOURS = {
     (255, 255, 0): 1838,       # Yellow -> 160m
-    (255, 0, 0): 3650,        # Red    -> 80m
-    (128, 128, 0): 7150,      # Olive  -> 40m
-    (0, 128, 0): 10125,        # Green  -> 30m
-    (0, 255, 255): 14175,      # Cyan   -> 20m
-    (0, 255, 0): 18118,        # Lime   -> 17m
-    (0, 128, 128): 21225,      # Teal   -> 15m
-    (0, 0, 255): 24940,        # Blue   -> 12m
-    (0, 0, 128): 28850,        # Navy   -> 10m
+    (255, 0, 0): 3650,         # Red    -> 80m
+    (128, 128, 0): 7150,       # Olive  -> 40m
+    (0, 128, 0): 10125,         # Green  -> 30m
+    (0, 255, 255): 14175,       # Cyan   -> 20m
+    (0, 255, 0): 18118,         # Lime   -> 17m
+    (0, 128, 128): 21225,       # Teal   -> 15m
+    (0, 0, 255): 24940,         # Blue   -> 12m
+    (0, 0, 128): 28850,         # Navy   -> 10m
 }
 
 # SWS uses white to represent an area where there is no HAP
 # frequency recommendation.
+
 HAP_EMPTY_COLOUR = (255, 255, 255)
 
 
@@ -189,7 +193,29 @@ class HAPGridPoint:
 @dataclass
 class HAPRecommendation:
     """
-    HAP recommendation at one geographic grid point and hour.
+    HAP propagation information at one geographic grid point and hour.
+
+    The primary band/frequency is the strongest local HAP result.
+
+    band_support contains the number of sampled pixels supporting every
+    recognised HAP band in the local neighbourhood.
+
+    A grid point may therefore have support for multiple bands.
+
+    Important:
+
+        sample_support is the raw number of pixels supporting the
+        PRIMARY band.
+
+        band_support contains raw pixel counts for ALL recognised
+        bands found in the sample.
+
+    These values are sampling/decoder measurements. They are NOT:
+
+        - propagation probability
+        - signal strength
+        - contact probability
+        - path reliability
     """
 
     hour_utc: int
@@ -207,6 +233,8 @@ class HAPRecommendation:
     pixel_y: float
 
     sample_support: int
+
+    band_support: dict[str, int]
 
 
 @dataclass
@@ -400,6 +428,7 @@ class HAPCollector:
         self,
         config: HAPConfig,
         timestamp_utc: Optional[datetime] = None,
+        frequencies_khz: Optional[list[int]] = None,
     ) -> str:
 
         if timestamp_utc is None:
@@ -408,14 +437,25 @@ class HAPCollector:
                 timezone.utc
             )
 
-        frequencies = list(
-            BANDS.values()
-        )
+        # Preserve the original behaviour when no frequencies are
+        # supplied: request the complete HAP frequency set.
+        #
+        # Independent per-band HAP requests can instead pass a
+        # single-element list, e.g. [14175].
+        if frequencies_khz is None:
+            frequencies = list(
+                BANDS.values()
+            )
+        else:
+            frequencies = list(
+                frequencies_khz
+            )
 
         params = {
             "baslat": f"{config.base_lat:.4f}",
             "baslng": f"{config.base_lon:.4f}",
             "basename": config.base_name,
+
             "numfreqs": len(frequencies),
 
             "year": timestamp_utc.year,
@@ -443,8 +483,10 @@ class HAPCollector:
                 f"freq{index}"
             ] = frequency
 
-        # SWS expects freq10 to exist, even though we only use 9 frequencies.
-        params["freq10"] = ""
+        # SWS expects the complete freq1..freq10 parameter set.
+        # Any unused frequency slots must be explicitly blank.
+        for index in range(len(frequencies) + 1, 11):
+            params[f"freq{index}"] = ""
 
         return (
             f"{SWS_HAP_CGI}?"
@@ -598,8 +640,11 @@ class HAPCollector:
             (360, 381, 650, 560),
 
             (50, 631, 340, 808),
-            (360, 631, 650, 808),
+            (360, 631, 340, 808),
         ]
+
+        # Correct final panel coordinates.
+        boxes[-1] = (360, 631, 650, 808)
 
         panels: dict[int, Image.Image] = {}
 
@@ -669,7 +714,10 @@ class HAPCollector:
                 f"but found {len(image_urls)}."
             )
 
-        results: dict[int, HAPHourResult] = {}
+        results: dict[
+            int,
+            HAPHourResult,
+        ] = {}
 
         for page_index, image_url in enumerate(
             image_urls,
@@ -781,48 +829,50 @@ class HAPDecoder:
         panel: Image.Image,
         point: HAPGridPoint,
         radius: int = 2,
-    ) -> tuple[Optional[int], int]:
-
+    ) -> tuple[
+        Optional[int],
+        int,
+        dict[str, int],
+    ]:
         """
-        Sample a small neighbourhood around a geographic point.
+        Analyse every recognised HAP colour around a geographic point.
 
-        White is explicitly treated as the SWS "empty / no HAP
-        recommendation" colour.
+        Unlike the original sampler, this does NOT discard secondary
+        HAP bands.
 
-        The dominant recognised HAP colour is returned unless white
-        has equal or greater support.
+        Every recognised colour found in the sampling window is retained.
 
-        This is important because the SWS map can contain a small
-        amount of white around a valid coloured HAP region.
+        The PRIMARY recommendation is selected using distance-weighted
+        support:
+
+            pixels closest to the exact geographic point have more
+            influence than pixels farther away.
 
         Returns:
 
-            (frequency_khz, support)
+            (
+                primary_frequency_khz,
+                primary_support,
+                band_support,
+            )
 
-        frequency_khz:
+        band_support:
 
-            HAP frequency in kHz, or None when the sampled area
-            contains no usable HAP recommendation.
+            Dictionary containing the raw pixel count for every recognised
+            HAP band found in the sampling window.
 
-        support:
+        Important:
 
-            Number of pixels supporting the selected HAP frequency.
+            Pixel counts are sampling/decoder metrics.
 
-        IMPORTANT:
+            They are NOT:
 
-            sample_support is a decoder/sample metric only.
-
-            It is NOT:
-
-                - propagation probability
-                - signal strength
-                - contact reliability
-                - percentage chance of communication
+                - propagation probabilities
+                - signal strengths
+                - contact-success probabilities
         """
 
-        image = panel.convert(
-            "RGB"
-        )
+        image = panel.convert("RGB")
 
         centre_x = round(
             point.pixel_x
@@ -832,16 +882,27 @@ class HAPDecoder:
             point.pixel_y
         )
 
+        # --------------------------------------------------------------------
+        # Raw support for every recognised HAP colour.
+        # --------------------------------------------------------------------
+
         colour_counts: dict[
             tuple[int, int, int],
             int,
         ] = {}
 
-        white_count = 0
+        # --------------------------------------------------------------------
+        # Distance-weighted support.
+        #
+        # Used ONLY to determine the primary recommendation.
+        #
+        # Regional band support continues to use raw pixel counts.
+        # --------------------------------------------------------------------
 
-        # --------------------------------------------------------------------
-        # Sample the local neighbourhood.
-        # --------------------------------------------------------------------
+        weighted_counts: dict[
+            tuple[int, int, int],
+            float,
+        ] = {}
 
         for y in range(
             centre_y - radius,
@@ -849,7 +910,6 @@ class HAPDecoder:
         ):
 
             if y < 0 or y >= image.height:
-
                 continue
 
             for x in range(
@@ -858,113 +918,130 @@ class HAPDecoder:
             ):
 
                 if x < 0 or x >= image.width:
-
                     continue
 
                 rgb = image.getpixel(
                     (x, y)
                 )
 
-                # ------------------------------------------------------------
-                # SWS empty/no-recommendation colour.
-                # ------------------------------------------------------------
-
-                if rgb == HAP_EMPTY_COLOUR:
-
-                    white_count += 1
-
+                # Ignore white and any unknown colours.
+                if rgb not in HAP_COLOURS:
                     continue
 
-                # ------------------------------------------------------------
-                # Recognised HAP colour.
-                # ------------------------------------------------------------
-
-                if rgb in HAP_COLOURS:
-
-                    colour_counts[rgb] = (
-                        colour_counts.get(
-                            rgb,
-                            0,
-                        )
-                        + 1
+                colour_counts[rgb] = (
+                    colour_counts.get(
+                        rgb,
+                        0,
                     )
-
-                    continue
+                    + 1
+                )
 
                 # ------------------------------------------------------------
-                # Unknown colours are deliberately ignored.
-                #
-                # These can be:
-                #
-                #   - borders
-                #   - text
-                #   - map features
-                #   - anti-aliasing
-                #   - rendering artefacts
+                # Distance from the exact geographic sampling point.
                 # ------------------------------------------------------------
+
+                dx = (
+                    x
+                    - point.pixel_x
+                )
+
+                dy = (
+                    y
+                    - point.pixel_y
+                )
+
+                distance = (
+                    dx * dx
+                    + dy * dy
+                ) ** 0.5
+
+                # ------------------------------------------------------------
+                # Inverse-distance weighting.
+                #
+                # Exact centre:
+                #     weight = 1.0
+                #
+                # 1 pixel away:
+                #     weight ~= 0.5
+                #
+                # 2 pixels away:
+                #     weight ~= 0.333
+                #
+                # The +1 prevents division by zero.
+                # ------------------------------------------------------------
+
+                weight = (
+                    1.0
+                    / (1.0 + distance)
+                )
+
+                weighted_counts[rgb] = (
+                    weighted_counts.get(
+                        rgb,
+                        0.0,
+                    )
+                    + weight
+                )
 
         # --------------------------------------------------------------------
-        # No recognised HAP colour exists in the sample.
+        # Nothing recognised.
         # --------------------------------------------------------------------
 
         if not colour_counts:
 
-            return None, 0
+            return (
+                None,
+                0,
+                {},
+            )
 
         # --------------------------------------------------------------------
-        # Find the strongest recognised HAP colour.
+        # Select PRIMARY HAP colour using weighted support.
         # --------------------------------------------------------------------
 
-        dominant_colour = max(
-            colour_counts,
-            key=colour_counts.get,
+        primary_colour = max(
+            weighted_counts,
+            key=weighted_counts.get,
         )
 
-        dominant_count = (
-            colour_counts[
-                dominant_colour
-            ]
-        )
-
-        # --------------------------------------------------------------------
-        # White is considered a competing state.
-        #
-        # If white has EQUAL or GREATER support than the strongest HAP
-        # colour, treat the location as having no HAP recommendation.
-        #
-        # Example:
-        #
-        #   yellow = 24
-        #   white  = 1
-        #
-        # -> 160m
-        #
-        # But:
-        #
-        #   yellow = 12
-        #   white  = 13
-        #
-        # -> no HAP
-        #
-        # This prevents tiny isolated coloured pixels from creating
-        # false recommendations.
-        # --------------------------------------------------------------------
-
-        if white_count >= dominant_count:
-
-            return None, 0
-
-        # --------------------------------------------------------------------
-        # Convert the recognised RGB colour to a frequency.
-        # --------------------------------------------------------------------
-
-        frequency = HAP_COLOURS[
-            dominant_colour
+        primary_frequency = HAP_COLOURS[
+            primary_colour
         ]
 
+        primary_support = colour_counts[
+            primary_colour
+        ]
+
+        # --------------------------------------------------------------------
+        # Convert raw colour support into band support.
+        # --------------------------------------------------------------------
+
+        band_support: dict[
+            str,
+            int,
+        ] = {}
+
+        for colour, count in colour_counts.items():
+
+            frequency = HAP_COLOURS[
+                colour
+            ]
+
+            band = (
+                FREQUENCY_TO_BAND.get(
+                    frequency
+                )
+            )
+
+            if band is None:
+                continue
+
+            band_support[band] = count
+
         return (
-            frequency,
-            dominant_count,
+            primary_frequency,
+            primary_support,
+            band_support,
         )
 
     # ------------------------------------------------------------------------
@@ -976,15 +1053,19 @@ class HAPDecoder:
         hour_result: HAPHourResult,
     ) -> list[HAPRecommendation]:
 
-        results: list[HAPRecommendation] = []
+        results: list[
+            HAPRecommendation
+        ] = []
 
         for point in self.grid:
 
-            frequency, support = (
-                self.sample_point(
-                    hour_result.panel,
-                    point,
-                )
+            (
+                frequency,
+                support,
+                band_support,
+            ) = self.sample_point(
+                hour_result.panel,
+                point,
             )
 
             band = (
@@ -1010,6 +1091,8 @@ class HAPDecoder:
                     pixel_y=point.pixel_y,
 
                     sample_support=support,
+
+                    band_support=band_support,
                 )
             )
 
@@ -1021,7 +1104,10 @@ class HAPDecoder:
 
     def decode_all(
         self,
-        hap_hours: dict[int, HAPHourResult],
+        hap_hours: dict[
+            int,
+            HAPHourResult,
+        ],
     ) -> dict[
         int,
         list[HAPRecommendation],
@@ -1166,6 +1252,25 @@ class HAPDecoder:
         ],
         hour_utc: int,
     ) -> dict[str, int]:
+        """
+        Count HAP support for each band across the regional grid.
+
+        IMPORTANT:
+
+            A single grid point can now contribute to multiple bands.
+
+        Therefore the sum of all band counts can be greater than the
+        number of geographic grid points.
+
+        Example:
+
+            160m = 7/49
+            40m  = 15/49
+            30m  = 42/49
+
+        These are independent "grid points containing HAP colour support"
+        measurements rather than mutually exclusive classifications.
+        """
 
         counts = {
             band: 0
@@ -1178,11 +1283,20 @@ class HAPDecoder:
 
         for result in decoded[hour_utc]:
 
-            if result.band in counts:
+            # --------------------------------------------------------------
+            # Use ALL detected bands rather than only the primary band.
+            # --------------------------------------------------------------
 
-                counts[
-                    result.band
-                ] += 1
+            for band, support in (
+                result.band_support.items()
+            ):
+
+                if (
+                    band in counts
+                    and support > 0
+                ):
+
+                    counts[band] += 1
 
         return counts
 
@@ -1385,9 +1499,28 @@ def print_grid(
         )
 
         print(
-            f"  Sample support: "
+            f"  Primary sample support: "
             f"{base.sample_support}/25 pixels"
         )
+
+        if base.band_support:
+
+            support_text = ", ".join(
+                f"{band}={count}"
+                for band, count
+                in sorted(
+                    base.band_support.items(),
+                    key=lambda item: (
+                        -item[1],
+                        item[0],
+                    ),
+                )
+            )
+
+            print(
+                f"  All local HAP support: "
+                f"{support_text}"
+            )
 
 
 def print_base_forecast(
@@ -1434,11 +1567,12 @@ def print_base_forecast(
         f"{'UTC':>5}  "
         f"{'Band':>6}  "
         f"{'Frequency':>12}  "
-        f"{'Support':>8}"
+        f"{'Support':>8}  "
+        f"{'Other HAP Support'}"
     )
 
     print(
-        "-" * 48
+        "-" * 78
     )
 
     forecast = (
@@ -1455,7 +1589,8 @@ def print_base_forecast(
                 f"{hour:02d}     "
                 f"{'--':>6}  "
                 f"{'--':>12}  "
-                f"{'--':>8}"
+                f"{'--':>8}  "
+                f"--"
             )
 
             continue
@@ -1466,16 +1601,30 @@ def print_base_forecast(
                 f"{hour:02d}     "
                 f"{'--':>6}  "
                 f"{'--':>12}  "
-                f"{result.sample_support:>8}"
+                f"{result.sample_support:>8}  "
+                f"--"
             )
 
             continue
+
+        other_support = ", ".join(
+            f"{band}={support}"
+            for band, support
+            in sorted(
+                result.band_support.items(),
+                key=lambda item: (
+                    -item[1],
+                    item[0],
+                ),
+            )
+        )
 
         print(
             f"{hour:02d}     "
             f"{result.band:>6}  "
             f"{result.frequency_khz / 1000:>9.3f} MHz  "
-            f"{result.sample_support:>8}"
+            f"{result.sample_support:>8}  "
+            f"{other_support}"
         )
 
 
@@ -1530,7 +1679,10 @@ def print_regional_summary(
         ]
 
         active.sort(
-            key=lambda item: item[1],
+            key=lambda item: (
+                item[1],
+                item[0],
+            ),
             reverse=True,
         )
 
@@ -1595,6 +1747,7 @@ def main() -> None:
     base_name = "Nelson"
 
     base_lat = -41.27
+
     base_lon = 173.28
 
     collector = HAPCollector()
@@ -1817,3 +1970,5 @@ def main() -> None:
 if __name__ == "__main__":
 
     main()
+
+

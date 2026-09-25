@@ -1,0 +1,237 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard — RadioPathwayTool{% endblock %}
+
+{% block content %}
+
+<section class="page-heading">
+    <div>
+        <h1>HF Conditions</h1>
+        <p>Current amateur-radio propagation conditions</p>
+    </div>
+
+    <div class="last-update">
+        Last update:
+        <span id="last-update">Loading...</span>
+    </div>
+</section>
+
+
+<!-- =========================================================
+     BAND CONDITIONS
+     ========================================================= -->
+
+<section class="band-grid">
+
+    <div class="band-card" id="band-card-160m">
+        <div class="band-name">160m</div>
+        <div class="band-score" id="score-160m">--</div>
+        <div class="band-status" id="status-160m">Loading</div>
+        <div class="score-bar">
+            <div class="score-fill" id="bar-160m"></div>
+        </div>
+    </div>
+
+    <div class="band-card" id="band-card-80m">
+        <div class="band-name">80m</div>
+        <div class="band-score" id="score-80m">--</div>
+        <div class="band-status" id="status-80m">Loading</div>
+        <div class="score-bar">
+            <div class="score-fill" id="bar-80m"></div>
+        </div>
+    </div>
+
+    <div class="band-card" id="band-card-40m">
+        <div class="band-name">40m</div>
+        <div class="band-score" id="score-40m">--</div>
+        <div class="band-status" id="status-40m">Loading</div>
+        <div class="score-bar">
+            <div class="score-fill" id="bar-40m"></div>
+        </div>
+    </div>
+
+    <div class="band-card" id="band-card-30m">
+        <div class="band-name">30m</div>
+        <div class="band-score" id="score-30m">--</div>
+        <div class="band-status" id="status-30m">Loading</div>
+        <div class="score-bar">
+            <div class="score-fill" id="bar-30m"></div>
+        </div>
+    </div>
+
+    <div class="band-card" id="band-card-20m">
+        <div class="band-name">20m</div>
+        <div class="band-score" id="score-20m">--</div>
+        <div class="band-status" id="status-20m">Loading</div>
+        <div class="score-bar">
+            <div class="score-fill" id="bar-20m"></div>
+        </div>
+    </div>
+
+    <div class="band-card" id="band-card-17m">
+        <div class="band-name">17m</div>
+        <div class="band-score" id="score-17m">--</div>
+        <div class="band-status" id="status-17m">Loading</div>
+        <div class="score-bar">
+            <div class="score-fill" id="bar-17m"></div>
+        </div>
+    </div>
+
+    <div class="band-card" id="band-card-15m">
+        <div class="band-name">15m</div>
+        <div class="band-score" id="score-15m">--</div>
+        <div class="band-status" id="status-15m">Loading</div>
+        <div class="score-bar">
+            <div class="score-fill" id="bar-15m"></div>
+        </div>
+    </div>
+
+    <div class="band-card" id="band-card-12m">
+        <div class="band-name">12m</div>
+        <div class="band-score" id="score-12m">--</div>
+        <div class="band-status" id="status-12m">Loading</div>
+        <div class="score-bar">
+            <div class="score-fill" id="bar-12m"></div>
+        </div>
+    </div>
+
+    <div class="band-card" id="band-card-10m">
+        <div class="band-name">10m</div>
+        <div class="band-score" id="score-10m">--</div>
+        <div class="band-status" id="status-10m">Loading</div>
+        <div class="score-bar">
+            <div class="score-fill" id="bar-10m"></div>
+        </div>
+    </div>
+
+</section>
+
+
+<!-- =========================================================
+     SPACE WEATHER + PROPAGATION
+     ========================================================= -->
+
+<section class="dashboard-grid">
+
+    <div class="panel">
+        <div class="panel-header">
+            <h2>☀️ Space Weather</h2>
+        </div>
+
+        <div class="weather-grid">
+
+            <div class="metric">
+                <span class="metric-label">Solar Flux</span>
+                <span class="metric-value" id="sfi">--</span>
+            </div>
+
+            <div class="metric">
+                <span class="metric-label">K Index</span>
+                <span class="metric-value" id="k-index">--</span>
+            </div>
+
+            <div class="metric">
+                <span class="metric-label">A Index</span>
+                <span class="metric-value" id="a-index">--</span>
+            </div>
+
+            <div class="metric">
+                <span class="metric-label">X-Ray</span>
+                <span class="metric-value" id="xray">--</span>
+            </div>
+
+        </div>
+    </div>
+
+
+    <div class="panel">
+
+        <div class="panel-header">
+            <h2>📡 Propagation</h2>
+        </div>
+
+        <div class="path-card">
+
+            <div class="path-title">
+                <span id="tx-location">Nelson</span>
+                →
+                <span id="rx-location">Australia</span>
+            </div>
+
+            <div class="path-description">
+                Current HAP recommendation:
+                <strong id="current-band">--</strong>
+                <span id="current-frequency"></span>
+            </div>
+
+            <div class="path-description">
+                Grid support:
+                <strong id="current-support">--</strong>
+            </div>
+
+            <button class="details-button">
+                Detailed Analysis
+            </button>
+
+        </div>
+
+    </div>
+
+</section>
+
+
+<!-- =========================================================
+     NEXT PROPAGATION WINDOW
+     ========================================================= -->
+
+<section class="panel next-window">
+
+    <div class="panel-header">
+        <h2>🔭 Next Propagation Window</h2>
+    </div>
+
+    <div class="window-content">
+
+        <div class="window-path">
+            <span id="next-tx-location">Nelson</span>
+            →
+            <span id="next-rx-location">Australia</span>
+        </div>
+
+        <div class="window-band" id="next-band">
+            --
+        </div>
+
+        <div class="window-time" id="next-transition">
+            Loading...
+        </div>
+
+        <div class="window-time" id="next-frequency">
+            --
+        </div>
+
+    </div>
+
+</section>
+
+
+<!-- =========================================================
+     24-HOUR HAP FORECAST
+     ========================================================= -->
+
+<section class="panel hap-forecast">
+
+    <div class="panel-header">
+        <h2>🕐 24-Hour HAP Forecast</h2>
+        <p>UTC · Nelson base-point recommendation</p>
+    </div>
+
+    <div class="hap-timeline" id="hap-timeline">
+        <div class="hap-loading">
+            Loading forecast...
+        </div>
+    </div>
+
+</section>
+
+{% endblock %}

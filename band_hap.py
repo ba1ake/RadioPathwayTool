@@ -1,0 +1,461 @@
+"""
+Independent per-band SWS HAP collector.
+
+Each amateur band is requested independently from the SWS HAP CGI.
+The existing HAPCollector is reused for the actual SWS HTTP request
+and GIF extraction.
+"""
+
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from io import BytesIO
+from typing import Any
+from urllib.parse import urljoin
+
+import requests
+from PIL import Image
+
+from band_favorability import HAPCollector, HAPConfig
+
+
+BAND_FREQUENCIES_KHZ: dict[str, int] = {
+    "160m": 1838,
+    "80m": 3650,
+    "40m": 7150,
+    "30m": 10125,
+    "20m": 14175,
+    "17m": 18118,
+    "15m": 21225,
+    "12m": 24940,
+    "10m": 28850,
+}
+
+
+# Six hourly panels per 700x900 SWS GIF page.
+PANEL_BOXES = [
+    (50, 134, 340, 313),
+    (360, 134, 650, 313),
+    (50, 381, 340, 560),
+    (360, 381, 650, 560),
+    (50, 631, 340, 808),
+    (360, 631, 650, 808),
+]
+
+
+# Map area inside a cropped 290x179 panel.
+HAP_MAP_X_MIN = 12
+HAP_MAP_X_MAX = 289
+HAP_MAP_Y_MIN = 2
+HAP_MAP_Y_MAX = 178
+EDGE_INSET = 2
+
+
+# Known SWS HAP colours.
+HAP_COLORS = {
+    (255, 255, 255): "NONE",
+    (0, 128, 0): "30m",
+    (255, 255, 0): "160m",
+    (128, 128, 0): "40m",
+    (255, 0, 0): "80m",
+    (0, 255, 255): "20m",
+    (0, 255, 0): "17m",
+    (0, 128, 128): "15m",
+    (0, 0, 255): "12m",
+    (0, 0, 128): "10m",
+}
+
+SUPPORT_COLORS = set(HAP_COLORS) - {(255, 255, 255)}
+
+
+class IndependentHAPCollector:
+
+    def __init__(self, max_workers: int = 3):
+        self.max_workers = max_workers
+
+    # ------------------------------------------------------------------
+    # Create a config containing exactly ONE frequency.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _single_frequency_config(
+        config: HAPConfig,
+        frequency_khz: int,
+    ) -> HAPConfig:
+        """
+        HAPConfig contains the geographic parameters only.
+
+        The frequency itself is supplied directly to
+        HAPCollector.build_request_url().
+        """
+        return config
+
+    # ------------------------------------------------------------------
+    # Download SWS GIF pages.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _download_image(url: str) -> Image.Image:
+        response = requests.get(
+            url,
+            timeout=30,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "Chrome/153.0 Safari/537.36"
+                )
+            },
+        )
+
+        response.raise_for_status()
+
+        return Image.open(BytesIO(response.content)).convert("RGB")
+
+    def _fetch_images(
+        self,
+        config: HAPConfig,
+        timestamp_utc: datetime,
+        frequency_khz: int,
+    ) -> list[Image.Image]:
+
+        collector = HAPCollector()
+
+        # Request ONLY this frequency from SWS.
+        # This produces an independent HAP map for the band.
+        url = collector.build_request_url(
+            config=config,
+            timestamp_utc=timestamp_utc,
+            frequencies_khz=[frequency_khz],
+        )
+
+        html = collector.fetch_hap_page(url)
+
+        image_urls = collector.extract_image_urls(html)
+
+        image_urls = [
+            urljoin(url, image_url)
+            for image_url in image_urls
+        ]
+
+        if len(image_urls) == 0:
+            raise RuntimeError(
+                f"SWS returned no GIF images for {frequency_khz} kHz"
+            )
+
+        images: list[Image.Image] = []
+
+        for image_url in image_urls:
+            image = self._download_image(image_url)
+
+            if image.size == (700, 900):
+                images.append(image)
+
+        if len(images) == 0:
+            raise RuntimeError(
+                f"SWS returned no valid 700x900 HAP GIF images "
+                f"for {frequency_khz} kHz"
+            )
+
+        return images
+
+    @staticmethod
+    def _split_pages(
+        images: list[Image.Image],
+    ) -> list[Image.Image]:
+
+        panels: list[Image.Image] = []
+
+        for image in images:
+            for box in PANEL_BOXES:
+                panels.append(image.crop(box))
+
+        if len(panels) != 24:
+            raise RuntimeError(
+                f"Expected 24 HAP panels, got {len(panels)}"
+            )
+
+        return panels
+
+    # ------------------------------------------------------------------
+    # Grid conversion.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _grid_points(
+        config: HAPConfig,
+    ) -> list[dict[str, Any]]:
+
+        points = []
+
+        for row in range(config.nrows):
+
+            lat = (
+                config.nw_lat
+                - row * config.step_lat
+            )
+
+            for col in range(config.ncols):
+
+                lon = (
+                    config.nw_lon
+                    + col * config.step_lon
+                )
+
+                points.append(
+                    {
+                        "row": row,
+                        "col": col,
+                        "lat": lat,
+                        "lon": lon,
+                    }
+                )
+
+        return points
+
+    @staticmethod
+    def _pixel_for_point(
+        config: HAPConfig,
+        lat: float,
+        lon: float,
+    ) -> tuple[int, int]:
+
+        lat_span = (
+            (config.nrows - 1)
+            * config.step_lat
+        )
+
+        lon_span = (
+            (config.ncols - 1)
+            * config.step_lon
+        )
+
+        x0 = HAP_MAP_X_MIN + EDGE_INSET
+        x1 = HAP_MAP_X_MAX - EDGE_INSET
+
+        y0 = HAP_MAP_Y_MIN + EDGE_INSET
+        y1 = HAP_MAP_Y_MAX - EDGE_INSET
+
+        x_fraction = (
+            (lon - config.nw_lon)
+            / lon_span
+        )
+
+        y_fraction = (
+            (config.nw_lat - lat)
+            / lat_span
+        )
+
+        x = round(
+            x0 + x_fraction * (x1 - x0)
+        )
+
+        y = round(
+            y0 + y_fraction * (y1 - y0)
+        )
+
+        return (
+            max(0, min(289, x)),
+            max(0, min(178, y)),
+        )
+
+    # ------------------------------------------------------------------
+    # Sample HAP colour around a grid point.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sample_support(
+        image: Image.Image,
+        x: int,
+        y: int,
+        radius: int = 2,
+    ) -> int:
+
+        support = 0
+
+        for dy in range(-radius, radius + 1):
+
+            for dx in range(-radius, radius + 1):
+
+                px = x + dx
+                py = y + dy
+
+                if (
+                    px < 0
+                    or py < 0
+                    or px >= image.width
+                    or py >= image.height
+                ):
+                    continue
+
+                rgb = image.getpixel((px, py))
+
+                if rgb != (255, 255, 255) and rgb != (0, 0, 0):
+                    support += 1
+
+        return support
+
+    # ------------------------------------------------------------------
+    # Collect one band.
+    # ------------------------------------------------------------------
+
+    def collect_band(
+        self,
+        config: HAPConfig,
+        band: str,
+        frequency_khz: int,
+        timestamp_utc: datetime,
+    ) -> dict[int, dict[str, Any]]:
+
+        single_config = config
+
+        images = self._fetch_images(
+            config=single_config,
+            timestamp_utc=timestamp_utc,
+            frequency_khz=frequency_khz,
+        )
+
+        panels = self._split_pages(images)
+        grid = self._grid_points(single_config)
+
+        results: dict[int, dict[str, Any]] = {}
+
+        for hour, panel in enumerate(panels):
+
+            regional_support = 0
+            base_support = 0
+
+            for point in grid:
+
+                x, y = self._pixel_for_point(
+                    config=single_config,
+                    lat=point["lat"],
+                    lon=point["lon"],
+                )
+
+                support = self._sample_support(
+                    panel,
+                    x,
+                    y,
+                )
+
+                if support > 0:
+                    regional_support += 1
+
+                if (
+                    abs(point["lat"] - config.base_lat)
+                    < 1e-6
+                    and
+                    abs(point["lon"] - config.base_lon)
+                    < 1e-6
+                ):
+                    base_support = support
+
+            results[hour] = {
+                "supported": base_support > 0,
+                "support": base_support,
+                "supported_grid_points": regional_support,
+                "grid_points": len(grid),
+                "frequency_mhz": frequency_khz / 1000.0,
+            }
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Worker.
+    # ------------------------------------------------------------------
+
+    def _collect_one(
+        self,
+        config: HAPConfig,
+        band: str,
+        frequency_khz: int,
+        timestamp_utc: datetime,
+    ) -> tuple[str, dict[str, Any]]:
+
+        try:
+
+            hours = self.collect_band(
+                config=config,
+                band=band,
+                frequency_khz=frequency_khz,
+                timestamp_utc=timestamp_utc,
+            )
+
+            return band, {
+                "frequency_mhz": frequency_khz / 1000.0,
+                "hours": hours,
+            }
+
+        except Exception as exc:
+
+            return band, {
+                "frequency_mhz": frequency_khz / 1000.0,
+                "hours": {},
+                "error": (
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            }
+
+    # ------------------------------------------------------------------
+    # Collect every configured band.
+    # ------------------------------------------------------------------
+
+    def collect_all(
+        self,
+        config: HAPConfig,
+        frequencies_khz: list[int],
+        timestamp_utc: datetime,
+    ) -> dict[str, dict[str, Any]]:
+        """
+        Collect independent HAP predictions for every configured frequency.
+
+        Requests are deliberately performed sequentially rather than in
+        parallel.  SWS receives one request per frequency, and sequential
+        collection avoids concurrency/cache issues while remaining small
+        enough for the nine configured amateur-radio bands.
+        """
+
+        frequency_to_band = {
+            frequency: band
+            for band, frequency
+            in BAND_FREQUENCIES_KHZ.items()
+        }
+
+        jobs: list[tuple[str, int]] = []
+
+        for frequency_khz in frequencies_khz:
+
+            band = frequency_to_band.get(
+                frequency_khz,
+                f"{frequency_khz}kHz",
+            )
+
+            jobs.append(
+                (band, frequency_khz)
+            )
+
+        results: dict[str, dict[str, Any]] = {}
+
+        for band, frequency_khz in jobs:
+
+            returned_band, result = self._collect_one(
+                config=config,
+                band=band,
+                frequency_khz=frequency_khz,
+                timestamp_utc=timestamp_utc,
+            )
+
+            results[returned_band] = result
+
+        ordered: dict[str, dict[str, Any]] = {}
+
+        for band, _ in jobs:
+
+            if band in results:
+                ordered[band] = results[band]
+
+        return ordered
+
