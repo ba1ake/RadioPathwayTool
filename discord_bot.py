@@ -6,7 +6,7 @@ import discord
 from dotenv import load_dotenv
 
 from main import get_propagation_report
-
+from ai_assistant import ask_radio_assistant
 
 # ============================================================
 # CONFIGURATION
@@ -17,6 +17,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
 CACHE_SECONDS = 300  # 5 minutes
+ai_history: dict[int, list[dict]] = {}
 
 
 # ============================================================
@@ -48,6 +49,7 @@ cached_report = None
 cached_report_time = 0
 
 report_lock = asyncio.Lock()
+ai_history: dict[int, list[dict]] = {}
 
 
 async def get_cached_report():
@@ -1097,6 +1099,47 @@ async def on_message(message):
         await message.channel.send(
             "❓ Unknown command. "
             "Use `$help` to see available commands."
+        )
+
+        return
+
+    # ========================================================
+    # AI ASSISTANT — NORMAL MESSAGES
+    # ========================================================
+
+    if not content:
+        return
+
+    channel_id = message.channel.id
+    history = ai_history.get(channel_id, [])
+
+    try:
+
+        async with message.channel.typing():
+
+            answer, updated_history = await asyncio.to_thread(
+                ask_radio_assistant,
+                content,
+                history,
+            )
+
+        ai_history[channel_id] = updated_history
+
+        await send_long_message(
+            message.channel,
+            answer,
+        )
+
+    except Exception as exc:
+
+        print(
+            f"AI assistant error: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        await message.channel.send(
+            "❌ Sorry, I couldn't process that request right now."
         )
 
 

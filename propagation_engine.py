@@ -735,23 +735,18 @@ class GrafexParser:
         cls,
         line: str,
     ) -> GrafexHour | None:
-
         """
-        Parse a GRAFEX hourly line.
+        Parse a GRAFEX hourly prediction line.
 
-        Expected logical structure:
+        Current SWS GRAFEX format:
 
-            hour
-            first OWF
-            first EMUF
-            first ALF
-            symbol block
-            second OWF
-            second EMUF
-            second ALF
-            ending hour
+            HH OWF EMUF ALF SYMBOLS OWF EMUF ALF HH
 
-        The exact spacing is intentionally not strict.
+        Example:
+
+            12 3.9 0.5 0.0 FFF%%. 12
+
+        The symbol block may contain letters, %, and periods.
         """
 
         stripped = line.strip()
@@ -759,162 +754,139 @@ class GrafexParser:
         if not stripped:
             return None
 
-        # Remove leading '*' characters used by some GRAFEX
-        # representations.
+        # Remove decorative characters sometimes present around
+        # GRAFEX output.
         stripped = stripped.strip("* ")
 
         fields = stripped.split()
 
+        # Expected minimum:
+        # hour + 3 first-mode values + symbols
+        # + 3 second-mode values + ending hour
         if len(fields) < 9:
             return None
 
-        # Search for a two-digit hour.
-        hour_index = None
-
-        for index, field in enumerate(fields):
-
-            if re.fullmatch(
-                r"\d{2}",
-                field,
-            ):
-
-                candidate = int(field)
-
-                if 0 <= candidate <= 23:
-                    hour_index = index
-                    break
-
-        if hour_index is None:
+        # We expect the first field to be the UTC hour.
+        if not re.fullmatch(r"\d{2}", fields[0]):
             return None
 
-        remaining = fields[hour_index:]
+        hour = int(fields[0])
 
-        if len(remaining) < 9:
+        if not 0 <= hour <= 23:
             return None
 
-        hour_text = remaining[0]
-
-        try:
-            hour = int(hour_text)
-        except ValueError:
-            return None
-
-        # Try the canonical layout first.
+        # Current GRAFEX output uses:
         #
-        # hour, OWF, EMUF, ALF, symbols,
-        # OWF, EMUF, ALF, end_hour
+        # HH OWF EMUF ALF SYMBOLS OWF EMUF ALF HH
+        #
+        # However, keep the symbol block detection flexible
+        # because older GRAFEX output can contain spaces.
 
-        if len(remaining) >= 9:
+        first_owf = cls.parse_float(fields[1])
+        first_emuf = cls.parse_float(fields[2])
+        first_alf = cls.parse_float(fields[3])
 
-            first_owf = cls.parse_float(
-                remaining[1]
+        if (
+            first_owf is None
+            or first_emuf is None
+            or first_alf is None
+        ):
+            return None
+
+        # Find the first numeric field after the symbol block.
+        #
+        # A numeric GRAFEX field looks like:
+        #   3
+        #   3.9
+        #   0.0
+        numeric_pattern = re.compile(
+            r"-?\d+(?:\.\d+)?"
+        )
+
+        symbol_end = None
+
+        for index in range(4, len(fields)):
+            if numeric_pattern.fullmatch(fields[index]):
+                symbol_end = index
+                break
+
+        if symbol_end is None:
+            return None
+
+        # Everything between ALF and the next numeric field
+        # is the symbol block.
+        symbols = " ".join(
+            fields[4:symbol_end]
+        )
+
+        if not cls._looks_like_symbol_block(
+            symbols
+        ):
+            return None
+
+        numeric_after = fields[symbol_end:]
+
+        # Need:
+        # second OWF
+        # second EMUF
+        # second ALF
+        # ending hour
+        if len(numeric_after) < 4:
+            return None
+
+        second_owf = cls.parse_float(
+            numeric_after[0]
+        )
+        second_emuf = cls.parse_float(
+            numeric_after[1]
+        )
+        second_alf = cls.parse_float(
+            numeric_after[2]
+        )
+
+        end_hour_text = numeric_after[3]
+
+        if (
+            second_owf is None
+            or second_emuf is None
+            or second_alf is None
+        ):
+            return None
+
+        if not re.fullmatch(
+            r"\d{2}",
+            end_hour_text,
+        ):
+            return None
+
+        end_hour = int(end_hour_text)
+
+        if not 0 <= end_hour <= 23:
+            return None
+
+        # GRAFEX repeats the hour at the end of the row.
+        if end_hour != hour:
+            return None
+
+        frequency_predictions = (
+            cls.parse_frequency_predictions(
+                symbols
             )
+        )
 
-            first_emuf = cls.parse_float(
-                remaining[2]
-            )
+        if not frequency_predictions:
+            return None
 
-            first_alf = cls.parse_float(
-                remaining[3]
-            )
-
-            # The symbol block can itself contain spaces.
-            # Find the first numeric field after it.
-            symbol_end = None
-
-            for index in range(4, len(remaining)):
-
-                if re.fullmatch(
-                    r"-?\d+(?:\.\d+)?",
-                    remaining[index],
-                ):
-
-                    if index >= 5:
-                        symbol_end = index
-                        break
-
-            if symbol_end is not None:
-
-                symbols = " ".join(
-                    remaining[4:symbol_end]
-                )
-
-                if cls._looks_like_symbol_block(
-                    symbols
-                ):
-
-                    numeric_after = remaining[
-                        symbol_end:
-                    ]
-
-                    if len(numeric_after) >= 4:
-
-                        second_owf = cls.parse_float(
-                            numeric_after[0]
-                        )
-
-                        second_emuf = cls.parse_float(
-                            numeric_after[1]
-                        )
-
-                        second_alf = cls.parse_float(
-                            numeric_after[2]
-                        )
-
-                        end_hour_text = numeric_after[3]
-
-                        if re.fullmatch(
-                            r"\d{2}",
-                            end_hour_text,
-                        ):
-
-                            end_hour = int(
-                                end_hour_text
-                            )
-
-                            if end_hour == hour:
-
-                                frequency_predictions = (
-                                    cls.parse_frequency_predictions(
-                                        symbols
-                                    )
-                                )
-
-                                if frequency_predictions:
-
-                                    return GrafexHour(
-                                        utc_hour=hour,
-
-                                        first_owf_mhz=(
-                                            first_owf
-                                        ),
-
-                                        first_emuf_mhz=(
-                                            first_emuf
-                                        ),
-
-                                        first_alf_mhz=(
-                                            first_alf
-                                        ),
-
-                                        second_owf_mhz=(
-                                            second_owf
-                                        ),
-
-                                        second_emuf_mhz=(
-                                            second_emuf
-                                        ),
-
-                                        second_alf_mhz=(
-                                            second_alf
-                                        ),
-
-                                        frequencies=(
-                                            frequency_predictions
-                                        ),
-                                    )
-
-        return None
+        return GrafexHour(
+            utc_hour=hour,
+            first_owf_mhz=first_owf,
+            first_emuf_mhz=first_emuf,
+            first_alf_mhz=first_alf,
+            second_owf_mhz=second_owf,
+            second_emuf_mhz=second_emuf,
+            second_alf_mhz=second_alf,
+            frequencies=frequency_predictions,
+        )
 
     @classmethod
     def _extract_hour_rows(

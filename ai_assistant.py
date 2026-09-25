@@ -608,6 +608,11 @@ TOOLS = [
                 "The propagation engine will use those locations "
                 "to run the actual point-to-point GRAFEX prediction. "
                 "\n\n"
+                "For an explicit GRAFEX request, such as "
+                "'run GRAFEX for Nelson to Mumbai', this tool "
+                "MUST be called with both endpoints. "
+                "Do not use HAP as a substitute for GRAFEX. "
+                "\n\n"
                 "Examples of path-specific questions include: "
                 "'How do I reach Sydney from Nelson?', "
                 "'What bands could I use from Nelson to Sydney?', "
@@ -637,7 +642,7 @@ TOOLS = [
                         "description": (
                             "Receiver location. "
                             "Use a clear location such as "
-                            "'Sydney, Australia'. "
+                            "'Mumbai, India'. "
                             "Required for a path-specific "
                             "propagation prediction."
                         ),
@@ -653,11 +658,12 @@ TOOLS = [
             "name": "get_hap_forecast",
             "description": (
                 "Get the current HAP HF propagation forecast. "
-                "Use this for questions about HAP predictions, "
-                "band predictions, upcoming HAP transitions, "
-                "or regional HAP distribution. "
-                "If the user specifies a TX/RX path, provide "
-                "both locations."
+                "Use this for questions specifically asking "
+                "about HAP predictions, band predictions, "
+                "upcoming HAP transitions, or regional HAP "
+                "distribution. "
+                "Do NOT use this as a substitute when the user "
+                "explicitly requests GRAFEX."
             ),
             "parameters": {
                 "type": "object",
@@ -690,8 +696,8 @@ TOOLS = [
                 "Use this when the user asks about MUF observations, "
                 "ionospheric enhancement/depression, or current "
                 "station-level ionospheric conditions. "
-                "If the question is specifically about a path, "
-                "provide TX and RX locations when available."
+                "Do NOT use this as a substitute when the user "
+                "explicitly requests GRAFEX."
             ),
             "parameters": {
                 "type": "object",
@@ -724,9 +730,8 @@ TOOLS = [
                 "and current space-weather alerts. "
                 "Use this for questions specifically about solar "
                 "or geomagnetic weather. "
-                "If the user asks for space weather in the context "
-                "of a specific propagation path, provide TX/RX "
-                "locations when available."
+                "Do NOT use this as a substitute when the user "
+                "explicitly requests GRAFEX."
             ),
             "parameters": {
                 "type": "object",
@@ -769,6 +774,112 @@ AVAILABLE_TOOLS = {
 
 
 # ============================================================
+# GRAFEX REQUEST DETECTION
+# ============================================================
+
+def is_explicit_grafex_request(
+    user_message: str,
+) -> bool:
+    """
+    Detect whether the user explicitly requested GRAFEX.
+
+    This is intentionally deterministic so the Python layer
+    can enforce GRAFEX-specific behaviour even if the language
+    model attempts to substitute another dataset.
+    """
+
+    if not isinstance(
+        user_message,
+        str,
+    ):
+        return False
+
+    text = user_message.lower().strip()
+
+    grafex_terms = (
+        "grafex",
+        "grafex prediction",
+        "grafex forecast",
+        "run grafex",
+        "make a grafex",
+        "do a grafex",
+        "grafex for",
+        "grafex on",
+        "grafex between",
+    )
+
+    return any(
+        term in text
+        for term in grafex_terms
+    )
+
+
+def report_has_grafex(tool_result: Any) -> bool:
+    """
+    Determine whether a get_propagation_report tool result
+    actually contains usable GRAFEX data.
+
+    Tool results are wrapped like:
+
+    {
+        "type": "propagation_report",
+        "status": "ok",
+        "data": {
+            "grafex": ...
+        }
+    }
+    """
+
+    if not isinstance(tool_result, dict):
+        return False
+
+    if tool_result.get("status") != "ok":
+        return False
+
+    data = tool_result.get("data")
+
+    if not isinstance(data, dict):
+        return False
+
+    grafex = data.get("grafex")
+
+    if grafex is None:
+        return False
+
+    if isinstance(grafex, dict):
+
+        status = str(
+            grafex.get("status", "")
+        ).lower()
+
+        if status in {
+            "error",
+            "unavailable",
+            "failed",
+            "none",
+            "missing",
+        }:
+            return False
+
+        meaningful_keys = (
+            set(grafex.keys())
+            - {
+                "status",
+                "error",
+                "message",
+                "warning",
+            }
+        )
+
+        return bool(meaningful_keys)
+
+    if isinstance(grafex, list):
+        return len(grafex) > 0
+
+    return True
+
+
+# ============================================================
 # SYSTEM PROMPT
 # ============================================================
 
@@ -784,7 +895,7 @@ Never invent measurements, forecasts, path results, frequencies, times, alerts, 
 ============================================================
 
 1. CORE RULE
-   ============================================================
+============================================================
 
 Use this evidence chain:
 
@@ -814,7 +925,7 @@ that conclusion.
 
 ============================================================
 2. RESPONSE STYLE
-=================
+============================================================
 
 Be concise and directly answer the user's question.
 
@@ -838,7 +949,7 @@ If the user asks a simple question, give a simple answer.
 
 ============================================================
 3. TOOL SELECTION
-=================
+============================================================
 
 Use the appropriate tool when current information is required.
 
@@ -884,7 +995,7 @@ tool.
 
 ============================================================
 4. PATH-SPECIFIC QUESTIONS
-==========================
+============================================================
 
 When the user asks about propagation between two locations:
 
@@ -900,8 +1011,8 @@ Example:
 Call:
 
 get_propagation_report(
-tx_location="Nelson, New Zealand",
-rx_location="Sydney, Australia"
+    tx_location="Nelson, New Zealand",
+    rx_location="Sydney, Australia"
 )
 
 Example:
@@ -911,8 +1022,8 @@ Example:
 Call:
 
 get_propagation_report(
-tx_location="Blenheim, New Zealand",
-rx_location="Brisbane, Australia"
+    tx_location="Blenheim, New Zealand",
+    rx_location="Brisbane, Australia"
 )
 
 Do NOT call the zero-location version for a path-specific question.
@@ -923,8 +1034,116 @@ GRAFEX result.
 If GRAFEX is unavailable, say so rather than estimating the result.
 
 ============================================================
+4A. GRAFEX LOCATION REQUIREMENTS
+============================================================
+
+GRAFEX requires a specific transmitter and receiver location.
+
+A city, town, or specific station is a valid endpoint.
+
+Examples:
+
+"Nelson to Mumbai"
+
+means:
+
+TX = Nelson, New Zealand
+RX = Mumbai, India
+
+"Nelson to Sydney"
+
+means:
+
+TX = Nelson, New Zealand
+RX = Sydney, Australia
+
+Minor obvious spelling mistakes should be corrected when the
+intended location is unambiguous.
+
+For example:
+
+"mubai" → Mumbai
+
+"nelson" → Nelson, New Zealand
+
+Do NOT silently convert a whole country, continent, or broad region
+into an arbitrary point.
+
+For example:
+
+"Nelson to India"
+
+is insufficient for a single path-specific GRAFEX prediction.
+
+Ask which city or receiver location in India is intended.
+
+Likewise:
+
+"Nelson to Australia"
+
+should ask which city or receiver location is intended.
+
+If the user provides a city, town, or station, use it.
+
+============================================================
+4B. EXPLICIT GRAFEX REQUESTS
+============================================================
+
+If the user explicitly asks for GRAFEX, such as:
+
+"grafex for Nelson to Mumbai"
+
+"run GRAFEX"
+
+"make a GRAFEX"
+
+"what does GRAFEX predict"
+
+"grafex prediction for Nelson to Sydney"
+
+then this is a DIRECT GRAFEX REQUEST.
+
+For a direct GRAFEX request:
+
+1. Identify TX.
+2. Identify RX.
+3. If either endpoint is missing, ask for it.
+4. If either endpoint is only a broad country or region, ask for
+   a specific city or location.
+5. Call get_propagation_report with BOTH endpoints.
+6. Use the returned GRAFEX data.
+7. If GRAFEX is not returned, state that GRAFEX was not returned.
+8. Do NOT replace missing GRAFEX data with HAP.
+9. Do NOT replace missing GRAFEX data with ionosphere data.
+10. Do NOT replace missing GRAFEX data with space-weather data.
+11. Do NOT provide a substitute band recommendation unless the
+    user separately asked for one.
+
+If the user explicitly asks for GRAFEX and the propagation report
+does not contain GRAFEX data, the correct response is:
+
+"The propagation report did not return a GRAFEX result for the
+requested path."
+
+Do not follow that statement with a HAP recommendation.
+
+Do not say:
+
+"GRAFEX is unavailable, however HAP suggests 160m."
+
+Do not say:
+
+"Since GRAFEX is unavailable, 160m is the best band."
+
+Do not say:
+
+"HAP can be used instead."
+
+A missing GRAFEX result is simply missing GRAFEX data.
+
+============================================================
 5. GRAFEX
-=========
+============================================================
 
 GRAFEX is a path-specific HF propagation model.
 
@@ -982,7 +1201,7 @@ Do not invent a MUF or OWF.
 
 ============================================================
 6. FREQUENCY RECOMMENDATIONS
-============================
+============================================================
 
 When the user asks which frequency or band to try:
 
@@ -1019,7 +1238,7 @@ say that the model does not establish it.
 
 ============================================================
 7. HAP
-======
+============================================================
 
 HAP provides MODEL PREDICTIONS.
 
@@ -1099,7 +1318,7 @@ Not:
 
 ============================================================
 8. SPACE WEATHER
-================
+============================================================
 
 Always distinguish the measurement from what it directly indicates.
 
@@ -1191,7 +1410,7 @@ propagation is unaffected.
 
 ============================================================
 9. IONOSPHERIC OBSERVATIONS
-===========================
+============================================================
 
 Ionospheric observations are station-specific.
 
@@ -1215,7 +1434,7 @@ it.
 
 ============================================================
 10. SPACE-WEATHER ALERTS
-========================
+============================================================
 
 Distinguish:
 
@@ -1242,7 +1461,7 @@ Do not invent radio effects from an alert.
 
 ============================================================
 11. MISSING DATA
-================
+============================================================
 
 Missing data means unavailable information.
 
@@ -1264,9 +1483,12 @@ normal."
 GOOD:
 "Current ionospheric observations are unavailable."
 
+For an explicit GRAFEX request, missing GRAFEX data must not be
+replaced by another propagation dataset.
+
 ============================================================
 12. CURRENT VS FUTURE
-=====================
+============================================================
 
 Clearly distinguish observations from forecasts.
 
@@ -1281,7 +1503,7 @@ Clearly label model predictions and forecasts as predictions.
 
 ============================================================
 13. TIME
-========
+============================================================
 
 Never invent or guess a timezone.
 
@@ -1297,7 +1519,7 @@ propagation event.
 
 ============================================================
 14. GENERAL HF SCIENCE
-======================
+============================================================
 
 You may explain general scientific concepts such as:
 
@@ -1323,7 +1545,7 @@ band is working.
 
 ============================================================
 15. UNSUPPORTED SIGNAL CLAIMS
-=============================
+============================================================
 
 Do not claim:
 
@@ -1342,7 +1564,7 @@ Propagation predictions are not signal-strength measurements.
 
 ============================================================
 16. PATH INFERENCE
-==================
+============================================================
 
 Never infer a path condition from an unrelated station.
 
@@ -1357,7 +1579,7 @@ replace path-specific analysis.
 
 ============================================================
 17. DATA PRIORITY
-=================
+============================================================
 
 When multiple datasets are available, use the dataset appropriate to
 the question.
@@ -1370,15 +1592,18 @@ HAP/regional information as supporting context
 ↓
 station observations and space weather as additional context
 
-Do not allow general regional information to override a returned
-path-specific GRAFEX result.
+For an explicit GRAFEX request, only the GRAFEX result answers the
+GRAFEX request.
+
+Do not use HAP, ionosphere, or space weather as a replacement for a
+missing GRAFEX result.
 
 Do not combine multiple weak indicators into a strong conclusion
 unless the data explicitly supports that conclusion.
 
 ============================================================
 18. CONCISENESS
-===============
+============================================================
 
 The user normally wants an operational answer, not a complete
 scientific report.
@@ -1409,7 +1634,7 @@ field unless the user asks for a detailed analysis.
 
 ============================================================
 19. FINAL VALIDATION
-====================
+============================================================
 
 Before answering, check:
 
@@ -1457,10 +1682,16 @@ def message_to_dict(
     dictionaries.
     """
 
-    if isinstance(message, dict):
+    if isinstance(
+        message,
+        dict,
+    ):
         return message
 
-    if hasattr(message, "model_dump"):
+    if hasattr(
+        message,
+        "model_dump",
+    ):
         try:
             return message.model_dump(
                 exclude_none=True
@@ -1468,7 +1699,10 @@ def message_to_dict(
         except Exception:
             pass
 
-    if hasattr(message, "dict"):
+    if hasattr(
+        message,
+        "dict",
+    ):
         try:
             return message.dict(
                 exclude_none=True
@@ -1525,7 +1759,10 @@ def execute_tool_call(
         if arguments is None:
             parsed_arguments = {}
 
-        elif isinstance(arguments, dict):
+        elif isinstance(
+            arguments,
+            dict,
+        ):
             parsed_arguments = arguments
 
         else:
@@ -1630,6 +1867,21 @@ def ask_radio_assistant(
             "content": user_message,
         }
     )
+
+    # --------------------------------------------------------
+    # Deterministic GRAFEX request tracking.
+    #
+    # This prevents the model from replacing a failed GRAFEX
+    # request with HAP or another dataset.
+    # --------------------------------------------------------
+
+    explicit_grafex_request = (
+        is_explicit_grafex_request(
+            user_message
+        )
+    )
+
+    grafex_was_returned = False
 
     # --------------------------------------------------------
     # Tool loop
@@ -1739,6 +1991,24 @@ def ask_radio_assistant(
                 )
 
             # ------------------------------------------------
+            # HARD GRAFEX ENFORCEMENT
+            #
+            # If the user explicitly requested GRAFEX and the
+            # actual propagation report did not contain GRAFEX,
+            # NEVER allow the model to substitute HAP, ionosphere,
+            # space weather, or a generic recommendation.
+            # ------------------------------------------------
+
+            if (
+                explicit_grafex_request
+                and not grafex_was_returned
+            ):
+                final_answer = (
+                    "The propagation report did not return a "
+                    "GRAFEX result for the requested path."
+                )
+
+            # ------------------------------------------------
             # Only retain normal user/assistant conversation.
             #
             # Do not preserve tool payloads from this turn.
@@ -1798,10 +2068,107 @@ def ask_radio_assistant(
                 "",
             )
 
-            result = execute_tool_call(
-                tool_name,
-                arguments,
-            )
+            # ------------------------------------------------
+            # For an explicit GRAFEX request, do not allow
+            # secondary datasets to become substitutes.
+            # ------------------------------------------------
+
+            if (
+                explicit_grafex_request
+                and tool_name != "get_propagation_report"
+            ):
+
+                result = {
+                    "status": "error",
+                    "error": (
+                        "The user explicitly requested GRAFEX. "
+                        "Do not use this tool as a substitute. "
+                        "Call get_propagation_report with both "
+                        "the transmitter and receiver locations."
+                    ),
+                }
+
+            else:
+
+                result = execute_tool_call(
+                    tool_name,
+                    arguments,
+                )
+
+            # ------------------------------------------------
+            # Track whether an explicit GRAFEX request actually
+            # received GRAFEX data.
+            # ------------------------------------------------
+
+            if (
+                explicit_grafex_request
+                and tool_name == "get_propagation_report"
+            ):
+
+                print(
+                    "\n===== GRAFEX TOOL RESULT =====",
+                    flush=True,
+                )
+
+                print(
+                    json.dumps(
+                        result,
+                        indent=2,
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                    flush=True,
+                )
+
+                print(
+                    "===== END GRAFEX TOOL RESULT =====\n",
+                    flush=True,
+                )
+
+                grafex_was_returned = (
+                    report_has_grafex(
+                        result
+                    )
+                )
+
+                # ------------------------------------------------
+                # HARD STOP
+                #
+                # If GRAFEX was explicitly requested and the
+                # propagation report does not contain it, stop
+                # immediately.
+                #
+                # This prevents Mistral from seeing HAP and then
+                # trying to construct a replacement answer.
+                # ------------------------------------------------
+
+                if not grafex_was_returned:
+
+                    final_answer = (
+                        "The propagation report did not return "
+                        "a GRAFEX result for the requested path."
+                    )
+
+                    updated_history = [
+                        *history,
+                        {
+                            "role": "user",
+                            "content": user_message,
+                        },
+                        {
+                            "role": "assistant",
+                            "content": final_answer,
+                        },
+                    ]
+
+                    updated_history = updated_history[
+                        -MAX_HISTORY_MESSAGES:
+                    ]
+
+                    return (
+                        final_answer,
+                        updated_history,
+                    )
 
             # ------------------------------------------------
             # Mistral expects tool results as role=tool
@@ -1827,6 +2194,18 @@ def ask_radio_assistant(
         "I wasn't able to complete the propagation analysis "
         "within the tool-call limit."
     )
+
+    # If this was an explicit GRAFEX request, do not give a
+    # generic fallback that could be interpreted as a successful
+    # propagation analysis.
+    if (
+        explicit_grafex_request
+        and not grafex_was_returned
+    ):
+        fallback_answer = (
+            "The propagation report did not return a "
+            "GRAFEX result for the requested path."
+        )
 
     return (
         fallback_answer,

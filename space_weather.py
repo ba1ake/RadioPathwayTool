@@ -1,9 +1,8 @@
-
 """
 Space Weather Data Collector
 ============================
 
-V0.1
+V0.2
 
 Purpose:
     Collect the space-weather information needed by the HF propagation
@@ -20,18 +19,21 @@ Data sources:
         - space-weather alerts
 
     Australian Space Weather Services (SWS)
+        - Public real-time T-index pages
         - Australian-region K index
         - Australian-region A index
         - Australian-region Dst
         - magnetic alerts/warnings
         - aurora alerts/watches/outlooks
 
-    SWS requires an API key.
-    Set the environment variable:
+IMPORTANT:
+    SWS real-time T-index values are collected from the public SWS
+    Real Time T Index web pages and do NOT require an API key.
 
-        SWS_API_KEY
+    The SWS API remains available for the other SWS products when
+    SWS_API_KEY is configured.
 
-    NOAA's public JSON products do not currently require an API key.
+    We deliberately do NOT substitute K-index for T-index.
 
 This module deliberately separates DATA COLLECTION from the propagation
 scoring engine.
@@ -41,8 +43,10 @@ The output can later be passed into band_favorability.py.
 
 from __future__ import annotations
 
+import html
 import json
 import os
+import re
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -60,9 +64,27 @@ SWS_API_BASE = (
     "https://sws-data.sws.bom.gov.au/api/v1"
 )
 
+# Public SWS pages.
+#
+# These pages contain the current real-time T-index values in their HTML.
+# No API key is required.
+SWS_PUBLIC_T_INDEX_AUSTRALASIA_URL = (
+    "https://www.sws.bom.gov.au/HF_Systems/1/6/3"
+)
+
+SWS_PUBLIC_T_INDEX_GLOBAL_URL = (
+    "https://www.sws.bom.gov.au/HF_Systems/6/4/2"
+)
+
 NOAA_BASE = (
     "https://services.swpc.noaa.gov"
 )
+
+HTTP_HEADERS = {
+    "User-Agent":
+        "HF-Propagation-Assistant/0.2 "
+        "(amateur-radio propagation analysis)"
+}
 
 
 # ============================================================================
@@ -172,6 +194,35 @@ class SpaceWeatherData:
     sws_error: Optional[str] = None
 
     # ------------------------------------------------------------------------
+    # Direct SWS real-time T-index values
+    #
+    # These are collected from the public SWS HTML pages.
+    #
+    # They are deliberately kept separate from K-index and other
+    # geomagnetic measurements.
+    # ------------------------------------------------------------------------
+
+    t_index_nz: Optional[float] = None
+
+    t_index_australia: Optional[float] = None
+    t_index_australian_region: Optional[float] = None
+
+    t_index_southern_australia: Optional[float] = None
+    t_index_northern_australia: Optional[float] = None
+    t_index_northern_equatorial_australia: Optional[float] = None
+
+    t_index_southern_hemisphere: Optional[float] = None
+    t_index_northern_hemisphere: Optional[float] = None
+
+    t_index_antarctic: Optional[float] = None
+
+    # Generic/default T-index.
+    t_index: Optional[float] = None
+
+    t_index_source: Optional[str] = None
+    t_index_retrieved_utc: Optional[str] = None
+
+    # ------------------------------------------------------------------------
     # Source status
     # ------------------------------------------------------------------------
 
@@ -202,15 +253,31 @@ def get_json(
     response = requests.get(
         url,
         timeout=timeout,
-        headers={
-            "User-Agent":
-                "HF-Propagation-Assistant/0.1"
-        },
+        headers=HTTP_HEADERS,
     )
 
     response.raise_for_status()
 
     return response.json()
+
+
+def get_text(
+    url: str,
+    timeout: int = REQUEST_TIMEOUT,
+) -> str:
+    """
+    Retrieve text/HTML from a public endpoint.
+    """
+
+    response = requests.get(
+        url,
+        timeout=timeout,
+        headers=HTTP_HEADERS,
+    )
+
+    response.raise_for_status()
+
+    return response.text
 
 
 def post_json(
@@ -227,9 +294,8 @@ def post_json(
         json=payload,
         timeout=timeout,
         headers={
+            **HTTP_HEADERS,
             "Content-Type": "application/json",
-            "User-Agent":
-                "HF-Propagation-Assistant/0.1",
         },
     )
 
@@ -299,6 +365,350 @@ def latest_record(
         return data
 
     return None
+
+
+# ============================================================================
+# SWS PUBLIC REAL-TIME T INDEX
+# ============================================================================
+
+def _clean_html_text(
+    page: str,
+) -> str:
+    """
+    Convert an SWS HTML page into searchable plain text.
+
+    This intentionally avoids requiring BeautifulSoup. The SWS pages expose
+    the T-index values as ordinary page text, so a small HTML stripper is
+    sufficient and keeps this module dependency-light.
+    """
+
+    # Remove scripts/styles first.
+    page = re.sub(
+        r"<script\b[^>]*>.*?</script>",
+        " ",
+        page,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    page = re.sub(
+        r"<style\b[^>]*>.*?</style>",
+        " ",
+        page,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # Remove remaining tags.
+    page = re.sub(
+        r"<[^>]+>",
+        " ",
+        page,
+        flags=re.DOTALL,
+    )
+
+    # Decode HTML entities.
+    page = html.unescape(page)
+
+    # Normalise whitespace.
+    page = re.sub(
+        r"\s+",
+        " ",
+        page,
+    )
+
+    return page.strip()
+
+
+def _extract_sws_t_index(
+    text: str,
+    label: str,
+) -> Optional[float]:
+    """
+    Extract an SWS T-index value from plain page text.
+
+    Example:
+
+        Australian Region T index: 52
+
+    Returns None when the value is unavailable.
+
+    SWS documents 999 as meaning that no autoscaled data is available.
+    We therefore treat 999 as unavailable rather than a real T-index.
+    """
+
+    pattern = (
+        re.escape(label)
+        + r"\s*:\s*"
+        + r"(-?\d+(?:\.\d+)?)"
+    )
+
+    match = re.search(
+        pattern,
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    if not match:
+        return None
+
+    value = safe_float(
+        match.group(1)
+    )
+
+    if value is None:
+        return None
+
+    # SWS uses 999 when autoscaled data is unavailable.
+    if value == 999:
+        return None
+
+    return value
+
+
+def get_sws_public_t_indices() -> dict[str, Any]:
+    """
+    Retrieve real-time T-index values from the public SWS webpages.
+
+    This does NOT require SWS_API_KEY.
+
+    Returns a dictionary containing any successfully parsed indices plus
+    source/error metadata.
+
+    Public SWS Australasia page provides:
+
+        Northern Equatorial Australian Region
+        Northern Australian Region
+        Southern Australian Region
+        Australian Region
+        Antarctic Region
+
+    Public SWS Global page provides:
+
+        Northern Hemisphere
+        Southern Hemisphere
+        Australian Region
+        Southern/Northern Australian regions
+        Antarctic Region
+
+    The public pages do not expose the Tnz value, so t_index_nz remains
+    unavailable unless another public SWS source is added later.
+    """
+
+    result: dict[str, Any] = {
+        "available": False,
+        "error": None,
+        "source": None,
+        "retrieved_utc": None,
+
+        "t_index_nz": None,
+
+        "t_index_australia": None,
+        "t_index_australian_region": None,
+
+        "t_index_southern_australia": None,
+        "t_index_northern_australia": None,
+        "t_index_northern_equatorial_australia": None,
+
+        "t_index_southern_hemisphere": None,
+        "t_index_northern_hemisphere": None,
+
+        "t_index_antarctic": None,
+
+        "raw": {},
+    }
+
+    retrieved = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    result["retrieved_utc"] = retrieved
+
+    # ------------------------------------------------------------------------
+    # Australasia public page
+    # ------------------------------------------------------------------------
+
+    try:
+
+        page = get_text(
+            SWS_PUBLIC_T_INDEX_AUSTRALASIA_URL
+        )
+
+        text = _clean_html_text(
+            page
+        )
+
+        result["raw"]["australasia_text"] = text
+
+        result[
+            "t_index_northern_equatorial_australia"
+        ] = _extract_sws_t_index(
+            text,
+            "Northern Equatorial Australian Region T index",
+        )
+
+        result[
+            "t_index_northern_australia"
+        ] = _extract_sws_t_index(
+            text,
+            "Northern Australian Region T index",
+        )
+
+        result[
+            "t_index_southern_australia"
+        ] = _extract_sws_t_index(
+            text,
+            "Southern Australian Region T index",
+        )
+
+        result[
+            "t_index_australian_region"
+        ] = _extract_sws_t_index(
+            text,
+            "Australian Region T index",
+        )
+
+        result[
+            "t_index_antarctic"
+        ] = _extract_sws_t_index(
+            text,
+            "Antarctic Region T index",
+        )
+
+    except Exception as exc:
+
+        result["raw"]["australasia_error"] = (
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    # ------------------------------------------------------------------------
+    # Global public page
+    # ------------------------------------------------------------------------
+
+    try:
+
+        page = get_text(
+            SWS_PUBLIC_T_INDEX_GLOBAL_URL
+        )
+
+        text = _clean_html_text(
+            page
+        )
+
+        result["raw"]["global_text"] = text
+
+        result[
+            "t_index_northern_hemisphere"
+        ] = _extract_sws_t_index(
+            text,
+            "Northern hemisphere T index",
+        )
+
+        result[
+            "t_index_southern_hemisphere"
+        ] = _extract_sws_t_index(
+            text,
+            "Southern hemisphere T index",
+        )
+
+        # The global page also exposes these values. Use them only when
+        # the Australasia page did not already provide them.
+        if (
+            result["t_index_australian_region"]
+            is None
+        ):
+            result[
+                "t_index_australian_region"
+            ] = _extract_sws_t_index(
+                text,
+                "Australian Region T index",
+            )
+
+        if (
+            result["t_index_antarctic"]
+            is None
+        ):
+            result[
+                "t_index_antarctic"
+            ] = _extract_sws_t_index(
+                text,
+                "Antarctic Region T index",
+            )
+
+        if (
+            result["t_index_southern_australia"]
+            is None
+        ):
+            result[
+                "t_index_southern_australia"
+            ] = _extract_sws_t_index(
+                text,
+                "Southern Australian Region T index",
+            )
+
+        if (
+            result["t_index_northern_australia"]
+            is None
+        ):
+            result[
+                "t_index_northern_australia"
+            ] = _extract_sws_t_index(
+                text,
+                "Northern Australian Region T index",
+            )
+
+        if (
+            result[
+                "t_index_northern_equatorial_australia"
+            ]
+            is None
+        ):
+            result[
+                "t_index_northern_equatorial_australia"
+            ] = _extract_sws_t_index(
+                text,
+                "Northern Equatorial Australian Region T index",
+            )
+
+    except Exception as exc:
+
+        result["raw"]["global_error"] = (
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    # ------------------------------------------------------------------------
+    # Determine whether anything useful was obtained.
+    # ------------------------------------------------------------------------
+
+    usable_fields = (
+        "t_index_australian_region",
+        "t_index_southern_australia",
+        "t_index_northern_australia",
+        "t_index_northern_equatorial_australia",
+        "t_index_southern_hemisphere",
+        "t_index_northern_hemisphere",
+        "t_index_antarctic",
+    )
+
+    if any(
+        result.get(field) is not None
+        for field in usable_fields
+    ):
+
+        result["available"] = True
+
+        result["source"] = (
+            "Australian Space Weather Services "
+            "public Real Time T Index pages"
+        )
+
+        return result
+
+    # No usable values.
+    result["error"] = (
+        "No usable real-time SWS T-index values "
+        "could be extracted from the public pages."
+    )
+
+    return result
 
 
 # ============================================================================
@@ -558,6 +968,10 @@ def get_noaa_alerts() -> list[dict[str, Any]]:
 def get_sws_api_key() -> Optional[str]:
     """
     Read the SWS API key from an environment variable.
+
+    This is only required for the authenticated SWS API products.
+
+    The public real-time T-index collector does NOT require this key.
     """
 
     return os.getenv(
@@ -838,14 +1252,17 @@ def collect_space_weather() -> SpaceWeatherData:
     The collector is deliberately fault tolerant.
 
     If one service fails, the remaining services are still used.
+
+    The public SWS T-index pages are collected independently of the
+    authenticated SWS API.
     """
 
     retrieved = datetime.now(
         timezone.utc
     ).isoformat()
 
-    status = {}
-    raw = {}
+    status: dict[str, str] = {}
+    raw: dict[str, Any] = {}
 
     # ------------------------------------------------------------------------
     # NOAA F10.7
@@ -912,7 +1329,106 @@ def collect_space_weather() -> SpaceWeatherData:
     raw["NOAA alerts"] = noaa_alerts
 
     # ------------------------------------------------------------------------
-    # SWS
+    # PUBLIC SWS REAL-TIME T INDEX
+    # ------------------------------------------------------------------------
+
+    public_t = (
+        get_sws_public_t_indices()
+    )
+
+    raw["SWS public T index"] = (
+        public_t.get("raw", {})
+    )
+
+    t_index_nz = (
+        public_t.get("t_index_nz")
+    )
+
+    t_index_australia = (
+        public_t.get("t_index_australia")
+    )
+
+    t_index_australian_region = (
+        public_t.get(
+            "t_index_australian_region"
+        )
+    )
+
+    t_index_southern_australia = (
+        public_t.get(
+            "t_index_southern_australia"
+        )
+    )
+
+    t_index_northern_australia = (
+        public_t.get(
+            "t_index_northern_australia"
+        )
+    )
+
+    t_index_northern_equatorial_australia = (
+        public_t.get(
+            "t_index_northern_equatorial_australia"
+        )
+    )
+
+    t_index_southern = (
+        public_t.get(
+            "t_index_southern_hemisphere"
+        )
+    )
+
+    t_index_northern = (
+        public_t.get(
+            "t_index_northern_hemisphere"
+        )
+    )
+
+    t_index_antarctic = (
+        public_t.get(
+            "t_index_antarctic"
+        )
+    )
+
+    # ------------------------------------------------------------------------
+    # Select a sensible generic direct T-index.
+    #
+    # This is NOT derived from K.
+    #
+    # For this project, the Southern Hemisphere value is preferred because
+    # the primary operating region is New Zealand / Australia.
+    # ------------------------------------------------------------------------
+
+    generic_t_index = (
+        t_index_southern
+        if t_index_southern is not None
+        else (
+            t_index_australian_region
+            if t_index_australian_region is not None
+            else t_index_southern_australia
+        )
+    )
+
+    if public_t.get("available"):
+
+        status["SWS public T-index"] = "OK"
+
+        raw["SWS public T-index source"] = (
+            public_t.get("source")
+        )
+
+        raw["SWS public T-index retrieved UTC"] = (
+            public_t.get("retrieved_utc")
+        )
+
+    else:
+
+        status["SWS public T-index"] = "FAILED"
+
+    # ------------------------------------------------------------------------
+    # Authenticated SWS API
+    #
+    # This remains optional.
     # ------------------------------------------------------------------------
 
     sws_key_available = bool(
@@ -944,10 +1460,6 @@ def collect_space_weather() -> SpaceWeatherData:
         aurora_outlook = (
             get_sws_aurora_outlook()
         )
-
-        sws_available = True
-
-        sws_error = None
 
         status["SWS K"] = (
             "OK"
@@ -989,13 +1501,32 @@ def collect_space_weather() -> SpaceWeatherData:
         a_index = None
         sws_dst = None
 
-        sws_available = False
+        # API itself is not configured, but this does NOT mean that
+        # public SWS T-index data is unavailable.
+        status["SWS API"] = "NOT CONFIGURED"
+
+    # ------------------------------------------------------------------------
+    # Overall SWS availability
+    #
+    # Public T-index data counts as SWS availability because it is an
+    # official SWS data product and is enough for GRAFEX T-index selection.
+    # ------------------------------------------------------------------------
+
+    sws_available = bool(
+        public_t.get("available")
+        or sws_key_available
+    )
+
+    if sws_available:
+
+        sws_error = None
+
+    else:
 
         sws_error = (
-            "SWS_API_KEY is not configured."
+            "No public SWS T-index data was available "
+            "and SWS_API_KEY is not configured."
         )
-
-        status["SWS"] = "NOT CONFIGURED"
 
     # ------------------------------------------------------------------------
     # Create normalised result
@@ -1031,6 +1562,52 @@ def collect_space_weather() -> SpaceWeatherData:
 
         sws_available=sws_available,
         sws_error=sws_error,
+
+        # --------------------------------------------------------------------
+        # Direct SWS T-index values
+        # --------------------------------------------------------------------
+
+        t_index_nz=t_index_nz,
+
+        t_index_australia=t_index_australia,
+
+        t_index_australian_region=(
+            t_index_australian_region
+        ),
+
+        t_index_southern_australia=(
+            t_index_southern_australia
+        ),
+
+        t_index_northern_australia=(
+            t_index_northern_australia
+        ),
+
+        t_index_northern_equatorial_australia=(
+            t_index_northern_equatorial_australia
+        ),
+
+        t_index_southern_hemisphere=(
+            t_index_southern
+        ),
+
+        t_index_northern_hemisphere=(
+            t_index_northern
+        ),
+
+        t_index_antarctic=(
+            t_index_antarctic
+        ),
+
+        t_index=generic_t_index,
+
+        t_index_source=(
+            public_t.get("source")
+        ),
+
+        t_index_retrieved_utc=(
+            public_t.get("retrieved_utc")
+        ),
 
         source_status=status,
 
@@ -1165,6 +1742,60 @@ def print_summary(
     )
 
     print()
+    print("REAL-TIME SWS T INDICES")
+    print("-" * 65)
+
+    print(
+        f"  NZ T-index:                    "
+        f"{weather.t_index_nz}"
+    )
+
+    print(
+        f"  Australian Region T-index:     "
+        f"{weather.t_index_australian_region}"
+    )
+
+    print(
+        f"  Southern Australia T-index:    "
+        f"{weather.t_index_southern_australia}"
+    )
+
+    print(
+        f"  Northern Australia T-index:    "
+        f"{weather.t_index_northern_australia}"
+    )
+
+    print(
+        f"  Northern Equatorial Australia:"
+        f" {weather.t_index_northern_equatorial_australia}"
+    )
+
+    print(
+        f"  Southern Hemisphere T-index:   "
+        f"{weather.t_index_southern_hemisphere}"
+    )
+
+    print(
+        f"  Northern Hemisphere T-index:   "
+        f"{weather.t_index_northern_hemisphere}"
+    )
+
+    print(
+        f"  Antarctic T-index:             "
+        f"{weather.t_index_antarctic}"
+    )
+
+    print(
+        f"  Generic T-index:               "
+        f"{weather.t_index}"
+    )
+
+    print(
+        f"  T-index source:                "
+        f"{weather.t_index_source}"
+    )
+
+    print()
     print("ALERTS")
     print("-" * 65)
 
@@ -1187,7 +1818,7 @@ def print_summary(
     ).items():
 
         print(
-            f"  {source:<20} {status}"
+            f"  {source:<30} {status}"
         )
 
     if weather.sws_error:
@@ -1249,4 +1880,3 @@ if __name__ == "__main__":
     print(
         "Saved: space_weather.json"
     )
-
