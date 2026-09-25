@@ -95,16 +95,17 @@ FREQUENCY_TO_BAND = {
 # HAP COLOURS
 # ============================================================================
 
+# These are the exact RGB colours used by the SWS HAP GIFs.
 HAP_COLOURS = {
-    (255, 255, 0): 1838,      # Yellow
-    (255, 0, 0): 3650,        # Red
-    (128, 128, 0): 7150,      # Olive
-    (0, 128, 0): 10125,       # Green
-    (0, 255, 255): 14175,     # Cyan
-    (0, 255, 0): 18118,       # Lime
-    (0, 128, 128): 21225,     # Teal
-    (0, 0, 255): 24940,       # Blue
-    (0, 0, 128): 28850,       # Navy
+    (255, 255, 0): 1838,       # Yellow -> 160m
+    (255, 0, 0): 3650,        # Red    -> 80m
+    (128, 128, 0): 7150,      # Olive  -> 40m
+    (0, 128, 0): 10125,        # Green  -> 30m
+    (0, 255, 255): 14175,      # Cyan   -> 20m
+    (0, 255, 0): 18118,        # Lime   -> 17m
+    (0, 128, 128): 21225,      # Teal   -> 15m
+    (0, 0, 255): 24940,        # Blue   -> 12m
+    (0, 0, 128): 28850,        # Navy   -> 10m
 }
 
 # SWS uses white to represent an area where there is no HAP
@@ -153,7 +154,6 @@ class HAPConfig:
     """
 
     base_name: str
-
     base_lat: float
     base_lon: float
 
@@ -172,7 +172,8 @@ class HAPConfig:
 @dataclass
 class HAPGridPoint:
     """
-    Geographic point and its corresponding location in the rendered HAP map.
+    Geographic point and its corresponding location in the rendered
+    HAP map.
     """
 
     row: int
@@ -298,7 +299,7 @@ class HAPCollector:
         config: HAPConfig,
     ) -> list[HAPGridPoint]:
 
-        points = []
+        points: list[HAPGridPoint] = []
 
         for row in range(config.nrows):
 
@@ -415,7 +416,6 @@ class HAPCollector:
             "baslat": f"{config.base_lat:.4f}",
             "baslng": f"{config.base_lon:.4f}",
             "basename": config.base_name,
-
             "numfreqs": len(frequencies),
 
             "year": timestamp_utc.year,
@@ -443,6 +443,7 @@ class HAPCollector:
                 f"freq{index}"
             ] = frequency
 
+        # SWS expects freq10 to exist, even though we only use 9 frequencies.
         params["freq10"] = ""
 
         return (
@@ -477,20 +478,43 @@ class HAPCollector:
         html: str,
     ) -> list[str]:
 
+        # SWS pages contain paths similar to:
+        #
+        # /olts/hapimgs/....
+        #
+        # They may be absolute or relative URLs.
+
+        pattern = (
+            r'(?:(?:https?:)?//[^"\']+)?'
+            r'/olts/hapimgs/[^"\']+\.gif'
+        )
+
         matches = re.findall(
-            r'(?:https?://[^"\']+)?'
-            r'/olts/hapimgs/[^"\']+\.gif',
+            pattern,
             html,
             flags=re.IGNORECASE,
         )
 
-        urls = []
+        urls: list[str] = []
 
         for match in matches:
 
-            if match.startswith("http"):
+            match = match.strip()
+
+            if not match:
+                continue
+
+            if match.startswith("http://"):
 
                 url = match
+
+            elif match.startswith("https://"):
+
+                url = match
+
+            elif match.startswith("//"):
+
+                url = "https:" + match
 
             else:
 
@@ -562,7 +586,9 @@ class HAPCollector:
         image: Image.Image,
     ) -> dict[int, Image.Image]:
 
-        image = image.convert("RGB")
+        image = image.convert(
+            "RGB"
+        )
 
         boxes = [
             (50, 134, 340, 313),
@@ -575,7 +601,7 @@ class HAPCollector:
             (360, 631, 650, 808),
         ]
 
-        panels = {}
+        panels: dict[int, Image.Image] = {}
 
         for index, box in enumerate(boxes):
 
@@ -607,10 +633,7 @@ class HAPCollector:
         )
 
         print()
-        print(
-            "HAP request:"
-        )
-
+        print("HAP request:")
         print(url)
 
         html = self.fetch_hap_page(
@@ -634,7 +657,19 @@ class HAPCollector:
             f"Found {len(image_urls)} HAP pages."
         )
 
-        results = {}
+        if len(image_urls) != 4:
+
+            print(
+                "WARNING:"
+            )
+
+            print(
+                "Expected 4 HAP pages "
+                "(24 hourly panels), "
+                f"but found {len(image_urls)}."
+            )
+
+        results: dict[int, HAPHourResult] = {}
 
         for page_index, image_url in enumerate(
             image_urls,
@@ -652,9 +687,13 @@ class HAPCollector:
                 )
             )
 
-            image = Image.open(
+            with Image.open(
                 image_path
-            )
+            ) as source_image:
+
+                image = source_image.convert(
+                    "RGB"
+                )
 
             panels = (
                 self.extract_hour_panels(
@@ -734,191 +773,199 @@ class HAPDecoder:
         )
 
     # ------------------------------------------------------------------------
-# Sample point
-# ------------------------------------------------------------------------
+    # Sample point
+    # ------------------------------------------------------------------------
 
-@staticmethod
-def sample_point(
-    panel: Image.Image,
-    point: HAPGridPoint,
-    radius: int = 2,
-) -> tuple[
-    Optional[int],
-    int,
-]:
-    """
-    Sample a small neighbourhood around a geographic point.
+    @staticmethod
+    def sample_point(
+        panel: Image.Image,
+        point: HAPGridPoint,
+        radius: int = 2,
+    ) -> tuple[Optional[int], int]:
 
-    The dominant HAP colour is returned.
+        """
+        Sample a small neighbourhood around a geographic point.
 
-    White is explicitly treated as the SWS "empty / no HAP
-    recommendation" colour.
+        White is explicitly treated as the SWS "empty / no HAP
+        recommendation" colour.
 
-    IMPORTANT:
+        The dominant recognised HAP colour is returned unless white
+        has equal or greater support.
 
-        White participates in the sample vote.
+        This is important because the SWS map can contain a small
+        amount of white around a valid coloured HAP region.
 
-        This prevents a small isolated coloured pixel from being
-        interpreted as a valid HAP recommendation when the surrounding
-        area is actually empty.
+        Returns:
 
-    Returns:
-
-        (frequency_khz, support)
-
-    Where:
+            (frequency_khz, support)
 
         frequency_khz:
-            The selected HAP frequency, or None if the sampled area
-            is empty / has no usable HAP colour.
+
+            HAP frequency in kHz, or None when the sampled area
+            contains no usable HAP recommendation.
 
         support:
-            Number of sampled pixels supporting the selected HAP
-            frequency.
 
-    sample_support is a decoder quality metric only.
+            Number of pixels supporting the selected HAP frequency.
 
-    It is NOT:
+        IMPORTANT:
 
-        - propagation probability
-        - signal strength
-        - contact reliability
-        - percentage chance of communication
-    """
+            sample_support is a decoder/sample metric only.
 
-    image = panel.convert(
-        "RGB"
-    )
+            It is NOT:
 
-    centre_x = round(
-        point.pixel_x
-    )
+                - propagation probability
+                - signal strength
+                - contact reliability
+                - percentage chance of communication
+        """
 
-    centre_y = round(
-        point.pixel_y
-    )
+        image = panel.convert(
+            "RGB"
+        )
 
-    # --------------------------------------------------------------------
-    # Count every relevant pixel.
-    #
-    # White is deliberately included because it represents the SWS
-    # "empty" state.
-    # --------------------------------------------------------------------
+        centre_x = round(
+            point.pixel_x
+        )
 
-    counts = {}
+        centre_y = round(
+            point.pixel_y
+        )
 
-    for y in range(
-        centre_y - radius,
-        centre_y + radius + 1,
-    ):
+        colour_counts: dict[
+            tuple[int, int, int],
+            int,
+        ] = {}
 
-        if (
-            y < 0
-            or y >= image.height
-        ):
-            continue
+        white_count = 0
 
-        for x in range(
-            centre_x - radius,
-            centre_x + radius + 1,
+        # --------------------------------------------------------------------
+        # Sample the local neighbourhood.
+        # --------------------------------------------------------------------
+
+        for y in range(
+            centre_y - radius,
+            centre_y + radius + 1,
         ):
 
-            if (
-                x < 0
-                or x >= image.width
+            if y < 0 or y >= image.height:
+
+                continue
+
+            for x in range(
+                centre_x - radius,
+                centre_x + radius + 1,
             ):
-                continue
 
-            rgb = image.getpixel(
-                (x, y)
-            )
+                if x < 0 or x >= image.width:
 
-            # ------------------------------------------------------------
-            # Explicit SWS empty colour.
-            # ------------------------------------------------------------
+                    continue
 
-            if rgb == HAP_EMPTY_COLOUR:
-
-                counts[
-                    "empty"
-                ] = (
-                    counts.get(
-                        "empty",
-                        0,
-                    )
-                    + 1
+                rgb = image.getpixel(
+                    (x, y)
                 )
 
-                continue
+                # ------------------------------------------------------------
+                # SWS empty/no-recommendation colour.
+                # ------------------------------------------------------------
 
-            # ------------------------------------------------------------
-            # Recognised HAP propagation colour.
-            # ------------------------------------------------------------
+                if rgb == HAP_EMPTY_COLOUR:
 
-            frequency = HAP_COLOURS.get(
-                rgb
-            )
+                    white_count += 1
 
-            if frequency is not None:
+                    continue
 
-                counts[
-                    frequency
-                ] = (
-                    counts.get(
-                        frequency,
-                        0,
+                # ------------------------------------------------------------
+                # Recognised HAP colour.
+                # ------------------------------------------------------------
+
+                if rgb in HAP_COLOURS:
+
+                    colour_counts[rgb] = (
+                        colour_counts.get(
+                            rgb,
+                            0,
+                        )
+                        + 1
                     )
-                    + 1
-                )
 
-                continue
+                    continue
 
-            # ------------------------------------------------------------
-            # Unknown colours are ignored.
-            #
-            # These may be borders, text, map features, anti-aliasing,
-            # or other rendering artefacts.
-            # ------------------------------------------------------------
+                # ------------------------------------------------------------
+                # Unknown colours are deliberately ignored.
+                #
+                # These can be:
+                #
+                #   - borders
+                #   - text
+                #   - map features
+                #   - anti-aliasing
+                #   - rendering artefacts
+                # ------------------------------------------------------------
 
-    # --------------------------------------------------------------------
-    # Nothing usable was sampled.
-    # --------------------------------------------------------------------
+        # --------------------------------------------------------------------
+        # No recognised HAP colour exists in the sample.
+        # --------------------------------------------------------------------
 
-    if not counts:
-        return None, 0
+        if not colour_counts:
 
-    # --------------------------------------------------------------------
-    # Determine the dominant sampled state.
-    # --------------------------------------------------------------------
+            return None, 0
 
-    dominant_state = max(
-        counts,
-        key=counts.get,
-    )
+        # --------------------------------------------------------------------
+        # Find the strongest recognised HAP colour.
+        # --------------------------------------------------------------------
 
-    dominant_count = counts[
-        dominant_state
-    ]
+        dominant_colour = max(
+            colour_counts,
+            key=colour_counts.get,
+        )
 
-    # --------------------------------------------------------------------
-    # If white / empty is dominant, there is no HAP recommendation.
-    # --------------------------------------------------------------------
+        dominant_count = (
+            colour_counts[
+                dominant_colour
+            ]
+        )
 
-    if dominant_state == "empty":
-        return None, 0
+        # --------------------------------------------------------------------
+        # White is considered a competing state.
+        #
+        # If white has EQUAL or GREATER support than the strongest HAP
+        # colour, treat the location as having no HAP recommendation.
+        #
+        # Example:
+        #
+        #   yellow = 24
+        #   white  = 1
+        #
+        # -> 160m
+        #
+        # But:
+        #
+        #   yellow = 12
+        #   white  = 13
+        #
+        # -> no HAP
+        #
+        # This prevents tiny isolated coloured pixels from creating
+        # false recommendations.
+        # --------------------------------------------------------------------
 
-    # --------------------------------------------------------------------
-    # Otherwise the dominant state is a HAP frequency.
-    # --------------------------------------------------------------------
+        if white_count >= dominant_count:
 
-    frequency = int(
-        dominant_state
-    )
+            return None, 0
 
-    return (
-        frequency,
-        dominant_count,
-    )
+        # --------------------------------------------------------------------
+        # Convert the recognised RGB colour to a frequency.
+        # --------------------------------------------------------------------
+
+        frequency = HAP_COLOURS[
+            dominant_colour
+        ]
+
+        return (
+            frequency,
+            dominant_count,
+        )
 
     # ------------------------------------------------------------------------
     # Decode one hour
@@ -929,7 +976,7 @@ def sample_point(
         hour_result: HAPHourResult,
     ) -> list[HAPRecommendation]:
 
-        results = []
+        results: list[HAPRecommendation] = []
 
         for point in self.grid:
 
@@ -980,7 +1027,10 @@ def sample_point(
         list[HAPRecommendation],
     ]:
 
-        decoded = {}
+        decoded: dict[
+            int,
+            list[HAPRecommendation],
+        ] = {}
 
         for hour in sorted(
             hap_hours
@@ -1039,9 +1089,7 @@ def sample_point(
             )
         )
 
-        for result in decoded[
-            hour_utc
-        ]:
+        for result in decoded[hour_utc]:
 
             if (
                 result.row == point.row
@@ -1088,7 +1136,10 @@ def sample_point(
         Optional[HAPRecommendation],
     ]:
 
-        forecast = {}
+        forecast: dict[
+            int,
+            Optional[HAPRecommendation],
+        ] = {}
 
         for hour in sorted(
             decoded
@@ -1125,9 +1176,7 @@ def sample_point(
 
             return counts
 
-        for result in decoded[
-            hour_utc
-        ]:
+        for result in decoded[hour_utc]:
 
             if result.band in counts:
 
@@ -1147,6 +1196,7 @@ def print_geometry(
 ) -> None:
 
     print()
+
     print(
         "=" * 78
     )
@@ -1216,6 +1266,7 @@ def print_grid(
     hour = recommendations[0].hour_utc
 
     print()
+
     print(
         "=" * 78
     )
@@ -1241,8 +1292,7 @@ def print_grid(
 
         longitude = (
             decoder.config.nw_lon
-            + col
-            * decoder.config.step_lon
+            + col * decoder.config.step_lon
         )
 
         print(
@@ -1262,8 +1312,7 @@ def print_grid(
 
         latitude = (
             decoder.config.nw_lat
-            - row
-            * decoder.config.step_lat
+            - row * decoder.config.step_lat
         )
 
         print(
@@ -1337,7 +1386,7 @@ def print_grid(
 
         print(
             f"  Sample support: "
-            f"{base.sample_support}"
+            f"{base.sample_support}/25 pixels"
         )
 
 
@@ -1350,6 +1399,7 @@ def print_base_forecast(
 ) -> None:
 
     print()
+
     print(
         "=" * 78
     )
@@ -1438,6 +1488,7 @@ def print_regional_summary(
 ) -> None:
 
     print()
+
     print(
         "=" * 78
     )
@@ -1504,9 +1555,17 @@ def print_regional_summary(
                 f"({percentage:.0f}%)"
             )
 
-        print(
-            " | ".join(parts)
-        )
+        if parts:
+
+            print(
+                " | ".join(parts)
+            )
+
+        else:
+
+            print(
+                "No recognised HAP recommendations"
+            )
 
 
 # ============================================================================
@@ -1516,6 +1575,7 @@ def print_regional_summary(
 def main() -> None:
 
     print()
+
     print(
         "=" * 78
     )
@@ -1535,7 +1595,6 @@ def main() -> None:
     base_name = "Nelson"
 
     base_lat = -41.27
-
     base_lon = 173.28
 
     collector = HAPCollector()
@@ -1606,6 +1665,11 @@ def main() -> None:
         f"{config.ncols // 2}"
     )
 
+    print(
+        f"  T-index     : "
+        f"{config.tindex}"
+    )
+
     # ------------------------------------------------------------------------
     # Decoder
     # ------------------------------------------------------------------------
@@ -1623,6 +1687,7 @@ def main() -> None:
     # ------------------------------------------------------------------------
 
     print()
+
     print(
         "Collecting HAP data..."
     )
@@ -1636,6 +1701,7 @@ def main() -> None:
     except Exception as exc:
 
         print()
+
         print(
             "HAP collection failed:"
         )
@@ -1647,6 +1713,7 @@ def main() -> None:
         raise SystemExit(1)
 
     print()
+
     print(
         "HAP collection successful."
     )
@@ -1705,6 +1772,7 @@ def main() -> None:
     # ------------------------------------------------------------------------
 
     print()
+
     print(
         "=" * 78
     )
@@ -1747,4 +1815,5 @@ def main() -> None:
 # ============================================================================
 
 if __name__ == "__main__":
+
     main()
