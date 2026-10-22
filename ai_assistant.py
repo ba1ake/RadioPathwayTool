@@ -637,6 +637,7 @@ TOOLS = [
         "function": {
             "name": "get_propagation_report",
             "description": (
+                "Use this tool when the user asks for information between 2 locations"
                 "Get the current structured HF propagation report. "
                 "This includes HAP, ionosphere, space weather, "
                 "and path-specific GRAFEX data when TX and RX "
@@ -903,6 +904,7 @@ For a normal GRAFEX or path-specific propagation question:
 - Do NOT reproduce the complete symbol table or legend by default.
 - Ensure that when responding with band lengths rather than Mhz that the correct ones are used (IE 80M band is 3.5Mhz not 17M = 17Mhz)
 - When a quick quesiton like "what freq is the best for X to Y at this time" endever to reponsed in a short manner
+
  
 The detailed GRAFEX data remains available to you and should be used
 to produce the concise interpretation.
