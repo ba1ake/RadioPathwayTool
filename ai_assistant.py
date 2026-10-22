@@ -104,9 +104,12 @@ def get_cached_propagation_report(
         else None
     )
 
+    # Cache keys are case-insensitive so "Nelson, New Zealand" and
+    # "nelson, new zealand" do not create duplicate entries. Keep the
+    # original trimmed strings for the engine call below.
     cache_key = (
-        tx_key,
-        rx_key,
+        tx_key.casefold() if tx_key else None,
+        rx_key.casefold() if rx_key else None,
     )
 
     now = time.time()
@@ -450,10 +453,11 @@ def tool_get_hap_forecast(
         # Use the independent HAP forecasts used by the dashboard.
         # These contain supported_grid_points/grid_points for regional
         # coverage rather than the raw HAP pixel support value.
-        hap = getattr(
+        # Support both dataclass/object reports and dictionary reports.
+        # get_report_value handles both representations consistently.
+        hap = get_report_value(
             report,
             "hap_band_forecast",
-            None,
         )
 
         if hap is None:
@@ -513,6 +517,13 @@ def tool_get_hap_forecast(
             "status": "ok",
             "tx_location": tx_location,
             "rx_location": rx_location,
+            "scope": "regional_grid",
+            "coverage_percent_semantics": (
+                "Percentage of decoded regional grid points supporting "
+                "the model prediction; not contact probability, not "
+                "path-specific success probability, and not a station-level "
+                "open/closed indicator."
+            ),
             "data": serialize_value(hap_with_coverage),
         }
 
@@ -997,6 +1008,14 @@ When several datasets are available, do not combine them into a
 stronger conclusion unless the supplied data explicitly supports
 that conclusion.
 
+If the same dataset contains conflicting values, different timestamps,
+or summaries that disagree with the underlying hourly records, do not
+choose whichever value supports a stronger recommendation. State that
+the data is inconsistent, quote the relevant timestamp/scope if
+available, and avoid a band recommendation until the conflict is
+resolved. Never combine values from different forecast runs as though
+they were one snapshot.
+
 ============================================================
 2. RESPONSE STYLE
 ============================================================
@@ -1171,6 +1190,13 @@ Do not substitute regional HAP information for a path-specific
 GRAFEX result.
 
 If GRAFEX is unavailable, say so rather than estimating the result.
+For an ordinary path-specific question, you may report HAP or space
+weather only as clearly labelled context. Do not derive a path-specific
+best band, best frequency, or contact likelihood from regional HAP
+coverage or space-weather indices alone. If the user still wants a
+practical band to try, explain that the supplied models do not establish
+one and suggest checking a suitable path-specific forecast or live
+on-air reports.
 
 ============================================================
 4A. GRAFEX LOCATION REQUIREMENTS
@@ -1403,6 +1429,22 @@ A HAP prediction is not proof that a real-world contact will occur.
 
 HAP regional percentages describe the proportion of decoded HAP grid
 points supporting a band.
+
+These values are regional coverage metrics, not a prediction for the
+complete transmitter-to-receiver circuit. Do not rank bands as "best"
+solely by comparing these percentages. A band with a higher percentage
+does not necessarily provide better propagation between the requested
+endpoints.
+
+For path-specific questions, first inspect the path-specific GRAFEX
+result. If GRAFEX is missing, clearly state that the path-specific
+prediction is unavailable. HAP may be mentioned as separate regional
+context, but it must not be presented as a substitute path prediction
+or used alone to name a best band or exact operating frequency.
+
+Do not convert HAP support into a contact probability, success rate,
+reliability score, or signal-strength estimate. Do not recommend 160m,
+80m, or any other band just because its grid coverage is the largest.
 
 Example:
 
