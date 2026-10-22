@@ -671,21 +671,16 @@ class GrafexParser:
                 )
             )
 
-            if symbol in {".", "A"}:
-                supported: bool | None = False
-
-            elif symbol in {
-                "F",
-                "B",
-                "P",
-                "E",
-                "M",
-                "S",
-                "X",
-                "%",
-            }:
+            # GRAFEX symbols describe predicted propagation modes/usability,
+            # not a binary guarantee that a contact will or will not work.
+            # Keep the boolean only for clear mode/usability indicators:
+            # "." means usable on fewer than 50% of days, so it is weak/limited,
+            # not categorically impossible. "A" (high absorption) and "X"
+            # (complex modes) are deliberately left indeterminate.
+            if symbol in {".", "A", "X"}:
+                supported: bool | None = None
+            elif symbol in {"%", "B", "F", "M", "E", "P", "S"}:
                 supported = True
-
             else:
                 supported = None
 
@@ -700,7 +695,6 @@ class GrafexParser:
 
         return predictions
 
-    @classmethod
     @staticmethod
     def _looks_like_symbol_block(value: str) -> bool:
         """
